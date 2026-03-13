@@ -344,7 +344,7 @@ describe("OpenClawPlugin", () => {
     it("returns appendSystemContext with routing instructions", async () => {
       const mock = await createTestPlugin(join(tempDir, "prompt-build"));
       const promptHook = mock.lifecycle.find(
-        (l) => l.event === "before_prompt_build",
+        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
       );
       expect(promptHook).toBeDefined();
 
@@ -356,7 +356,7 @@ describe("OpenClawPlugin", () => {
     it("has priority 5", async () => {
       const mock = await createTestPlugin(join(tempDir, "prompt-priority"));
       const promptHook = mock.lifecycle.find(
-        (l) => l.event === "before_prompt_build",
+        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
       );
       expect(promptHook?.opts?.priority).toBe(5);
     });

@@ -168,3 +168,74 @@ describe("compaction hooks", () => {
     assert.ok(resume.snapshot.length > 0, "snapshot must be non-empty");
   });
 });
+
+describe("resume injection (before_prompt_build)", () => {
+  beforeEach(() => { vi.resetModules(); });
+
+  test("before_prompt_build resume hook is registered at priority 10", async () => {
+    const { default: plugin } = await import("../src/openclaw-plugin.js");
+    const { api, typedHooks } = createMockApi();
+
+    plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+    const resumeHook = typedHooks.find(
+      h => h.hookName === "before_prompt_build" && h.opts?.priority === 10,
+    );
+    assert.ok(resumeHook, "resume before_prompt_build hook must be registered at priority 10");
+  });
+
+  test("resume injection returns prependSystemContext when resume exists and compact_count > 0", () => {
+    const db = createTestDB();
+    const sid = randomUUID();
+    const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
+    db.ensureSession(sid, projectDir);
+
+    db.upsertResume(sid, "## Resume\n\n- Did something", 3);
+    db.incrementCompactCount(sid);
+
+    const resume = db.getResume(sid);
+    const stats = db.getSessionStats(sid);
+
+    assert.ok(resume, "resume must exist");
+    assert.ok((stats?.compact_count ?? 0) > 0, "compact_count must be > 0");
+
+    const result = resume && (stats?.compact_count ?? 0) > 0
+      ? { prependSystemContext: resume.snapshot }
+      : undefined;
+
+    assert.ok(result, "result must be defined");
+    assert.ok(result.prependSystemContext.includes("## Resume"), "must include resume content");
+  });
+
+  test("resume injection returns undefined when no resume exists", () => {
+    const db = createTestDB();
+    const sid = randomUUID();
+    const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
+    db.ensureSession(sid, projectDir);
+
+    const resume = db.getResume(sid);
+    assert.equal(resume, null, "new session has no resume");
+
+    const result = resume ? { prependSystemContext: resume.snapshot } : undefined;
+    assert.equal(result, undefined, "must return undefined if no resume");
+  });
+
+  test("resume injection returns undefined when compact_count is 0", () => {
+    const db = createTestDB();
+    const sid = randomUUID();
+    const projectDir = join(tmpdir(), `proj-${randomUUID()}`);
+    db.ensureSession(sid, projectDir);
+
+    db.upsertResume(sid, "## Resume\n\n- Did something", 1);
+
+    const resume = db.getResume(sid);
+    const stats = db.getSessionStats(sid);
+    assert.ok(resume, "resume exists");
+    assert.equal(stats?.compact_count ?? 0, 0, "compact_count is 0");
+
+    const result = resume && (stats?.compact_count ?? 0) > 0
+      ? { prependSystemContext: resume.snapshot }
+      : undefined;
+    assert.equal(result, undefined, "must return undefined if compact_count is 0");
+  });
+});

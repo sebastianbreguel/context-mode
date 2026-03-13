@@ -8,7 +8,11 @@
  *   - tool_call:before hook   — Routing enforcement (deny/modify/passthrough)
  *   - tool_call:after hook    — Session event capture
  *   - command:new hook         — Session initialization and cleanup
- *   - before_prompt_build      — Routing instruction injection into system context
+ *   - session_start hook             — Re-key DB session to OpenClaw's session ID
+ *   - before_compaction hook         — Flush events to resume snapshot
+ *   - after_compaction hook          — Increment compact count
+ *   - before_prompt_build (p=10)  — Resume snapshot injection into system context
+ *   - before_prompt_build (p=5)   — Routing instruction injection into system context
  *   - context-mode engine      — Context engine with compaction management
  *   - /ctx-stats command       — Auto-reply command for session statistics
  *   - /ctx-doctor command      — Auto-reply command for diagnostics
@@ -343,7 +347,27 @@ export default {
       },
     );
 
-    // ── 7. before_prompt_build — Routing instruction injection ──
+    // ── 7. before_prompt_build — Resume snapshot injection ────
+
+    api.on(
+      "before_prompt_build",
+      () => {
+        try {
+          if (resumeInjected) return undefined;
+          const resume = db.getResume(sessionId);
+          if (!resume) return undefined;
+          const freshStats = db.getSessionStats(sessionId);
+          if ((freshStats?.compact_count ?? 0) === 0) return undefined;
+          resumeInjected = true;
+          return { prependSystemContext: resume.snapshot };
+        } catch {
+          return undefined;
+        }
+      },
+      { priority: 10 },
+    );
+
+    // ── 8. before_prompt_build — Routing instruction injection ──
 
     if (routingInstructions) {
       api.on(
@@ -355,7 +379,7 @@ export default {
       );
     }
 
-    // ── 8. Context engine — Compaction management ──────────
+    // ── 9. Context engine — Compaction management ──────────
 
     api.registerContextEngine("context-mode", () => ({
       info: {
@@ -392,7 +416,7 @@ export default {
       },
     }));
 
-    // ── 9. Auto-reply commands — ctx slash commands ───────
+    // ── 10. Auto-reply commands — ctx slash commands ──────
 
     if (api.registerCommand) {
       api.registerCommand({
