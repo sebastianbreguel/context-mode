@@ -549,6 +549,17 @@ describe("Bin entry uses cli.bundle.mjs", () => {
     expect(upgradeSection).toContain("cli.bundle.mjs");
   });
 
+  it("server.ts registers empty prompts/resources handlers to avoid -32601 (#168)", () => {
+    const src = readFileSync(resolve(ROOT, "src", "server.ts"), "utf-8");
+    // Must register prompts capability so clients don't get Method not found
+    expect(src).toContain("ListPromptsRequestSchema");
+    // Must register resources capability
+    expect(src).toContain("ListResourcesRequestSchema");
+    // Must return empty arrays
+    expect(src).toContain("prompts: []");
+    expect(src).toContain("resources: []");
+  });
+
   it("openclaw-plugin.ts doctor/upgrade use cli.bundle.mjs with fallback", () => {
     const src = readFileSync(resolve(ROOT, "src", "openclaw-plugin.ts"), "utf-8");
     expect(src).toContain("cli.bundle.mjs");
