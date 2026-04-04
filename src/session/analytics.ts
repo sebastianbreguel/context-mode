@@ -11,7 +11,7 @@
  *
  * Usage:
  *   const engine = new AnalyticsEngine(sessionDb);
- *   const commits = engine.commitCount("session-123");
+ *   const report = engine.queryAll(runtimeStats);
  */
 
 import type { SessionDB } from "./db.js";
@@ -111,6 +111,138 @@ export interface PatternInsight {
   pattern: string;
   confidence: number;
 }
+
+// ─────────────────────────────────────────────────────────
+// Runtime stats — passed in from server.ts (can't come from DB)
+// ─────────────────────────────────────────────────────────
+
+/** Runtime stats tracked by server.ts during a live session. */
+export interface RuntimeStats {
+  bytesReturned: Record<string, number>;
+  bytesIndexed: number;
+  bytesSandboxed: number;
+  calls: Record<string, number>;
+  sessionStart: number;
+  cacheHits: number;
+  cacheBytesSaved: number;
+}
+
+// ─────────────────────────────────────────────────────────
+// FullReport — single unified object returned by queryAll()
+// ─────────────────────────────────────────────────────────
+
+/** Unified report combining runtime stats, DB analytics, and continuity data. */
+export interface FullReport {
+  /** Runtime context savings (passed in, not from DB) */
+  savings: {
+    processed_kb: number;
+    entered_kb: number;
+    saved_kb: number;
+    pct: number;
+    savings_ratio: number;
+    by_tool: Array<{ tool: string; calls: number; context_kb: number; tokens: number }>;
+    total_calls: number;
+    total_bytes_returned: number;
+    kept_out: number;
+    total_processed: number;
+  };
+  cache?: {
+    hits: number;
+    bytes_saved: number;
+    ttl_hours_left: number;
+    total_with_cache: number;
+    total_savings_ratio: number;
+  };
+  /** Session metadata from SessionDB */
+  session: {
+    id: string;
+    duration_min: number | null;
+    tool_calls: number;
+    uptime_min: string;
+  };
+  /** Activity metrics */
+  activity: {
+    commits: number;
+    errors: number;
+    error_rate_pct: number;
+    tool_diversity: number;
+    efficiency_score: number;
+    commits_per_session_avg: number;
+    session_outcome: string;
+    productive_pct: number;
+    exploratory_pct: number;
+  };
+  /** Pattern metrics */
+  patterns: {
+    hourly_commits: number[];
+    weekly_trend: Array<{ day: string; sessions: number }>;
+    iteration_cycles: number;
+    rework: Array<{ file: string; edits: number }>;
+  };
+  /** Health metrics */
+  health: {
+    claude_md_freshness: Array<{ project: string; days_ago: number | null }>;
+    compactions_this_week: number;
+    weekly_sessions: number;
+    permission_denials: number;
+  };
+  /** Agent metrics */
+  agents: {
+    subagents: Array<{ type: string; count: number }>;
+    skills: Array<{ name: string; count: number }>;
+  };
+  /** Session continuity data */
+  continuity: {
+    total_events: number;
+    by_category: Array<{
+      category: string;
+      count: number;
+      label: string;
+      preview: string;
+      why: string;
+    }>;
+    compact_count: number;
+    resume_ready: boolean;
+  };
+}
+
+// ─────────────────────────────────────────────────────────
+// Category labels and hints for session continuity display
+// ─────────────────────────────────────────────────────────
+
+/** Human-readable labels for event categories. */
+export const categoryLabels: Record<string, string> = {
+  file: "Files tracked",
+  rule: "Project rules (CLAUDE.md)",
+  prompt: "Your requests saved",
+  mcp: "Plugin tools used",
+  git: "Git operations",
+  env: "Environment setup",
+  error: "Errors caught",
+  task: "Tasks in progress",
+  decision: "Your decisions",
+  cwd: "Working directory",
+  skill: "Skills used",
+  subagent: "Delegated work",
+  intent: "Session mode",
+  data: "Data references",
+  role: "Behavioral directives",
+};
+
+/** Explains why each category matters for continuity. */
+export const categoryHints: Record<string, string> = {
+  file: "Restored after compact \u2014 no need to re-read",
+  rule: "Your project instructions survive context resets",
+  prompt: "Continues exactly where you left off",
+  decision: "Applied automatically \u2014 won\u2019t ask again",
+  task: "Picks up from where it stopped",
+  error: "Tracked and monitored across compacts",
+  git: "Branch, commit, and repo state preserved",
+  env: "Runtime config carried forward",
+  mcp: "Tool usage patterns remembered",
+  subagent: "Delegation history preserved",
+  skill: "Skill invocations tracked",
+};
 
 // ─────────────────────────────────────────────────────────
 // AnalyticsEngine
@@ -594,4 +726,391 @@ export class AnalyticsEngine {
     ).get(sessionId) as { cnt: number };
     return row.cnt;
   }
+
+  // ═══════════════════════════════════════════════════════
+  // queryAll — single unified report from ONE source
+  // ═══════════════════════════════════════════════════════
+
+  /**
+   * Build a complete FullReport by merging runtime stats (passed in)
+   * with all 27 DB-backed metrics and continuity data.
+   *
+   * This is the ONE call that ctx_stats should use.
+   */
+  queryAll(runtimeStats: RuntimeStats): FullReport {
+    // ── Resolve latest session ID ──
+    const latestSession = this.db.prepare(
+      "SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1",
+    ).get() as { session_id: string } | undefined;
+    const sid = latestSession?.session_id ?? "";
+
+    // ── Runtime savings ──
+    const totalBytesReturned = Object.values(runtimeStats.bytesReturned).reduce(
+      (sum, b) => sum + b, 0,
+    );
+    const totalCalls = Object.values(runtimeStats.calls).reduce(
+      (sum, c) => sum + c, 0,
+    );
+    const keptOut = runtimeStats.bytesIndexed + runtimeStats.bytesSandboxed;
+    const totalProcessed = keptOut + totalBytesReturned;
+    const savingsRatio = totalProcessed / Math.max(totalBytesReturned, 1);
+    const reductionPct = totalProcessed > 0
+      ? Math.round((1 - totalBytesReturned / totalProcessed) * 100)
+      : 0;
+
+    const toolNames = new Set([
+      ...Object.keys(runtimeStats.calls),
+      ...Object.keys(runtimeStats.bytesReturned),
+    ]);
+    const byTool = Array.from(toolNames).sort().map((tool) => ({
+      tool,
+      calls: runtimeStats.calls[tool] || 0,
+      context_kb: Math.round((runtimeStats.bytesReturned[tool] || 0) / 1024 * 10) / 10,
+      tokens: Math.round((runtimeStats.bytesReturned[tool] || 0) / 4),
+    }));
+
+    const uptimeMs = Date.now() - runtimeStats.sessionStart;
+    const uptimeMin = (uptimeMs / 60_000).toFixed(1);
+
+    // ── Cache ──
+    let cache: FullReport["cache"];
+    if (runtimeStats.cacheHits > 0 || runtimeStats.cacheBytesSaved > 0) {
+      const totalWithCache = totalProcessed + runtimeStats.cacheBytesSaved;
+      const totalSavingsRatio = totalWithCache / Math.max(totalBytesReturned, 1);
+      const ttlHoursLeft = Math.max(0, 24 - Math.floor((Date.now() - runtimeStats.sessionStart) / (60 * 60 * 1000)));
+      cache = {
+        hits: runtimeStats.cacheHits,
+        bytes_saved: runtimeStats.cacheBytesSaved,
+        ttl_hours_left: ttlHoursLeft,
+        total_with_cache: totalWithCache,
+        total_savings_ratio: totalSavingsRatio,
+      };
+    }
+
+    // ── Session metrics ──
+    const durationMin = sid ? this.sessionDuration(sid) : null;
+    const toolCallsDb = sid ? (this.db.prepare(
+      "SELECT COUNT(*) as cnt FROM session_events WHERE session_id = ? AND category = 'mcp'",
+    ).get(sid) as { cnt: number }).cnt : 0;
+
+    // ── Activity metrics ──
+    const commits = sid ? this.commitCount(sid) : 0;
+    const errors = sid ? this.errorCount(sid) : 0;
+    const errorRatePct = sid ? this.errorRate(sid) : 0;
+    const toolDiversity = sid ? this.toolDiversity(sid) : 0;
+    const effScore = sid ? this.efficiencyScore(sid) : 0;
+    const commitsPerSessionAvg = this.commitsPerSession();
+    const sessionOutcome = sid ? this.sessionOutcome(sid) : "exploratory";
+    const mix = this.sessionMix();
+
+    // ── Pattern metrics ──
+    const hourlyRaw = this.hourlyProductivity(sid || undefined);
+    const hourlyCommits = Array.from({ length: 24 }, (_, i) => {
+      const h = String(i).padStart(2, "0");
+      return hourlyRaw.find((r) => r.hour === h)?.count ?? 0;
+    });
+    const weeklyTrend = this.weeklyTrend();
+    const iterCycles = sid ? this.iterationCycles(sid) : 0;
+    const rework = sid ? this.reworkRate(sid) : this.reworkRate();
+
+    // ── Health metrics ──
+    const claudeMdFreshness = this.claudeMdFreshness().map((r) => {
+      const daysAgo = r.last_updated
+        ? Math.round((Date.now() - new Date(r.last_updated).getTime()) / 86_400_000)
+        : null;
+      return { project: r.data, days_ago: daysAgo };
+    });
+    const compactionsThisWeek = sid ? this.compactionCount(sid) : 0;
+    const weeklySessions = this.weeklySessionCount();
+    const permDenials = sid ? this.permissionDenials(sid) : 0;
+
+    // ── Agent metrics ──
+    const subagents = sid
+      ? this.subagentUsage(sid).map((r) => ({ type: r.data, count: r.total }))
+      : [];
+    const skills = sid
+      ? this.skillUsage(sid).map((r) => ({ name: r.data, count: r.invocations }))
+      : [];
+
+    // ── Continuity data ──
+    const eventTotal = (this.db.prepare(
+      "SELECT COUNT(*) as cnt FROM session_events",
+    ).get() as { cnt: number }).cnt;
+
+    const byCategory = this.db.prepare(
+      "SELECT category, COUNT(*) as cnt FROM session_events GROUP BY category ORDER BY cnt DESC",
+    ).all() as Array<{ category: string; cnt: number }>;
+
+    const meta = this.db.prepare(
+      "SELECT compact_count FROM session_meta ORDER BY started_at DESC LIMIT 1",
+    ).get() as { compact_count: number } | undefined;
+    const compactCount = meta?.compact_count ?? 0;
+
+    const resume = this.db.prepare(
+      "SELECT event_count, consumed FROM session_resume ORDER BY created_at DESC LIMIT 1",
+    ).get() as { event_count: number; consumed: number } | undefined;
+    const resumeReady = resume ? !resume.consumed : false;
+
+    // Build category previews
+    const previewRows = this.db.prepare(
+      "SELECT category, type, data FROM session_events ORDER BY id DESC",
+    ).all() as Array<{ category: string; type: string; data: string }>;
+
+    const previews = new Map<string, Set<string>>();
+    for (const row of previewRows) {
+      if (!previews.has(row.category)) previews.set(row.category, new Set());
+      const set = previews.get(row.category)!;
+      if (set.size < 5) {
+        let display = row.data;
+        if (row.category === "file") {
+          display = row.data.split("/").pop() || row.data;
+        } else if (row.category === "prompt") {
+          display = display.length > 50 ? display.slice(0, 47) + "..." : display;
+        }
+        if (display.length > 40) display = display.slice(0, 37) + "...";
+        set.add(display);
+      }
+    }
+
+    const continuityByCategory = byCategory.map((row) => ({
+      category: row.category,
+      count: row.cnt,
+      label: categoryLabels[row.category] || row.category,
+      preview: previews.get(row.category)
+        ? Array.from(previews.get(row.category)!).join(", ")
+        : "",
+      why: categoryHints[row.category] || "Survives context resets",
+    }));
+
+    return {
+      savings: {
+        processed_kb: Math.round(totalProcessed / 1024 * 10) / 10,
+        entered_kb: Math.round(totalBytesReturned / 1024 * 10) / 10,
+        saved_kb: Math.round(keptOut / 1024 * 10) / 10,
+        pct: reductionPct,
+        savings_ratio: Math.round(savingsRatio * 10) / 10,
+        by_tool: byTool,
+        total_calls: totalCalls,
+        total_bytes_returned: totalBytesReturned,
+        kept_out: keptOut,
+        total_processed: totalProcessed,
+      },
+      cache,
+      session: {
+        id: sid,
+        duration_min: durationMin !== null ? Math.round(durationMin * 10) / 10 : null,
+        tool_calls: toolCallsDb,
+        uptime_min: uptimeMin,
+      },
+      activity: {
+        commits,
+        errors,
+        error_rate_pct: errorRatePct,
+        tool_diversity: toolDiversity,
+        efficiency_score: effScore,
+        commits_per_session_avg: commitsPerSessionAvg,
+        session_outcome: sessionOutcome,
+        productive_pct: mix.productive,
+        exploratory_pct: mix.exploratory,
+      },
+      patterns: {
+        hourly_commits: hourlyCommits,
+        weekly_trend: weeklyTrend,
+        iteration_cycles: iterCycles,
+        rework: rework.map((r) => ({ file: r.data, edits: r.edits })),
+      },
+      health: {
+        claude_md_freshness: claudeMdFreshness,
+        compactions_this_week: compactionsThisWeek,
+        weekly_sessions: weeklySessions,
+        permission_denials: permDenials,
+      },
+      agents: { subagents, skills },
+      continuity: {
+        total_events: eventTotal,
+        by_category: continuityByCategory,
+        compact_count: compactCount,
+        resume_ready: resumeReady,
+      },
+    };
+  }
+}
+
+// ─────────────────────────────────────────────────────────
+// formatReport — renders FullReport as markdown
+// ─────────────────────────────────────────────────────────
+
+/** Format bytes as human-readable KB or MB. */
+function kb(b: number): string {
+  if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)}MB`;
+  return `${(b / 1024).toFixed(1)}KB`;
+}
+
+/**
+ * Render a FullReport as the same markdown output ctx_stats has always produced.
+ *
+ * Preserves the exact output format: Context Window Protection table,
+ * TTL Cache section, Session Continuity table, and Analytics JSON block.
+ */
+export function formatReport(report: FullReport): string {
+  const lines: string[] = [
+    `## context-mode \u2014 Session Report (${report.session.uptime_min} min)`,
+  ];
+
+  // ── Feature 1: Context Window Protection ──
+  lines.push("", `### Context Window Protection`, "");
+
+  if (report.savings.total_calls === 0) {
+    lines.push(
+      `No context-mode tool calls yet. Use \`batch_execute\`, \`execute\`, or \`fetch_and_index\` to keep raw output out of your context window.`,
+    );
+  } else {
+    lines.push(
+      `| Metric | Value |`,
+      `|--------|------:|`,
+      `| Total data processed | **${kb(report.savings.total_processed)}** |`,
+      `| Kept in sandbox (never entered context) | **${kb(report.savings.kept_out)}** |`,
+      `| Entered context | ${kb(report.savings.total_bytes_returned)} |`,
+      `| Estimated tokens saved | ~${Math.round(report.savings.kept_out / 4).toLocaleString()} |`,
+      `| **Context savings** | **${report.savings.savings_ratio.toFixed(1)}x (${report.savings.pct}% reduction)** |`,
+    );
+
+    // Per-tool breakdown
+    if (report.savings.by_tool.length > 0) {
+      lines.push(
+        "",
+        `| Tool | Calls | Context | Tokens |`,
+        `|------|------:|--------:|-------:|`,
+      );
+      for (const t of report.savings.by_tool) {
+        lines.push(
+          `| ${t.tool} | ${t.calls} | ${kb(t.calls > 0 ? (t.tokens * 4) : 0)} | ~${t.tokens.toLocaleString()} |`,
+        );
+      }
+      lines.push(
+        `| **Total** | **${report.savings.total_calls}** | **${kb(report.savings.total_bytes_returned)}** | **~${Math.round(report.savings.total_bytes_returned / 4).toLocaleString()}** |`,
+      );
+    }
+
+    if (report.savings.kept_out > 0) {
+      lines.push(
+        "",
+        `Without context-mode, **${kb(report.savings.total_processed)}** of raw output would flood your context window. Instead, **${report.savings.pct}%** stayed in sandbox.`,
+      );
+    }
+
+    // Cache savings section
+    if (report.cache) {
+      lines.push(
+        "",
+        `### TTL Cache`,
+        "",
+        `| Metric | Value |`,
+        `|--------|------:|`,
+        `| Cache hits | **${report.cache.hits}** |`,
+        `| Data avoided by cache | **${kb(report.cache.bytes_saved)}** |`,
+        `| Network requests saved | **${report.cache.hits}** |`,
+        `| TTL remaining | **~${report.cache.ttl_hours_left}h** |`,
+        "",
+        `Content was already indexed in the knowledge base \u2014 ${report.cache.hits} fetch${report.cache.hits > 1 ? "es" : ""} skipped entirely. **${kb(report.cache.bytes_saved)}** of network I/O avoided. Search results served directly from local FTS5 index.`,
+      );
+
+      if (report.cache.total_savings_ratio > report.savings.savings_ratio) {
+        lines.push(
+          "",
+          `**Total context savings (sandbox + cache): ${report.cache.total_savings_ratio.toFixed(1)}x** \u2014 ${kb(report.cache.total_with_cache)} processed, only ${kb(report.savings.total_bytes_returned)} entered context.`,
+        );
+      }
+    }
+  }
+
+  // ── Session Continuity ──
+  if (report.continuity.total_events > 0) {
+    lines.push(
+      "",
+      "### Session Continuity",
+      "",
+      "| What's preserved | Count | I remember... | Why it matters |",
+      "|------------------|------:|---------------|----------------|",
+    );
+    for (const row of report.continuity.by_category) {
+      lines.push(
+        `| ${row.label} | ${row.count} | ${row.preview} | ${row.why} |`,
+      );
+    }
+    lines.push(
+      `| **Total** | **${report.continuity.total_events}** | | **Zero knowledge lost on compact** |`,
+    );
+
+    lines.push("");
+    if (report.continuity.compact_count > 0) {
+      lines.push(
+        `Context has been compacted **${report.continuity.compact_count} time(s)** \u2014 session knowledge was preserved each time.`,
+      );
+    } else {
+      lines.push(
+        `When your context compacts, all of this will restore Claude's awareness \u2014 no starting from scratch.`,
+      );
+    }
+    if (report.continuity.resume_ready) {
+      lines.push(`Resume snapshot ready for the next compaction.`);
+    }
+
+    lines.push("");
+    lines.push(
+      `> **Note:** Previous session data is loaded when you start a new session. Without \`--continue\`, old session history is cleaned up to keep the database lean.`,
+    );
+  }
+
+  // ── Analytics JSON ──
+  const analyticsJson = {
+    session: {
+      duration_min: report.session.duration_min,
+      tool_calls: report.session.tool_calls,
+    },
+    activity: {
+      commits: report.activity.commits,
+      errors: report.activity.errors,
+      error_rate_pct: report.activity.error_rate_pct,
+      tool_diversity: report.activity.tool_diversity,
+      efficiency_score: report.activity.efficiency_score,
+      commits_per_session_avg: report.activity.commits_per_session_avg,
+      session_outcome: report.activity.session_outcome,
+    },
+    patterns: {
+      hourly_commits: report.patterns.hourly_commits,
+      weekly_trend: report.patterns.weekly_trend,
+      iteration_cycles: report.patterns.iteration_cycles,
+      rework: report.patterns.rework,
+    },
+    health: {
+      claude_md_freshness: report.health.claude_md_freshness,
+      compactions_this_week: report.health.compactions_this_week,
+      weekly_sessions: report.health.weekly_sessions,
+      permission_denials: report.health.permission_denials,
+    },
+    agents: {
+      subagents: report.agents.subagents,
+      skills: report.agents.skills,
+    },
+    continuity: { total_events: report.continuity.total_events },
+  };
+
+  lines.push(
+    "",
+    "### Analytics (27 metrics)",
+    "",
+    "```json",
+    JSON.stringify(analyticsJson, null, 2),
+    "```",
+  );
+
+  // Formatting directive
+  lines.push(
+    "",
+    "---",
+    "_Display this entire report as-is in your response. Do NOT summarize, collapse, or paraphrase any section._",
+  );
+
+  return lines.join("\n");
 }

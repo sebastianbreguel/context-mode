@@ -27,7 +27,7 @@ import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix } from "./session/db.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -1605,6 +1605,20 @@ server.registerTool(
 // Tool: stats
 // ─────────────────────────────────────────────────────────
 
+/**
+ * Create a minimal in-memory DB adapter for when the session DB is unavailable.
+ * All queries return empty results so AnalyticsEngine.queryAll() still works.
+ */
+function createMinimalDb(): import("./session/analytics.js").DatabaseAdapter {
+  return {
+    prepare: () => ({
+      run: () => undefined,
+      get: (..._args: unknown[]) => ({ cnt: 0, compact_count: 0, minutes: null, rate: 0, avg: 0, outcome: "exploratory" }),
+      all: () => [],
+    }),
+  };
+}
+
 server.registerTool(
   "ctx_stats",
   {
@@ -1627,107 +1641,9 @@ server.registerTool(
         content: [{ type: "text" as const, text: "Session stats and search index reset." }],
       });
     }
-    const totalBytesReturned = Object.values(sessionStats.bytesReturned).reduce(
-      (sum, b) => sum + b,
-      0,
-    );
-    const totalCalls = Object.values(sessionStats.calls).reduce(
-      (sum, c) => sum + c,
-      0,
-    );
-    const uptimeMs = Date.now() - sessionStats.sessionStart;
-    const uptimeMin = (uptimeMs / 60_000).toFixed(1);
 
-    // Total data kept out of context = indexed (FTS5) + sandboxed (network I/O inside sandbox)
-    const keptOut = sessionStats.bytesIndexed + sessionStats.bytesSandboxed;
-    const totalProcessed = keptOut + totalBytesReturned;
-    const savingsRatio = totalProcessed / Math.max(totalBytesReturned, 1);
-    const reductionPct = totalProcessed > 0
-      ? ((1 - totalBytesReturned / totalProcessed) * 100).toFixed(0)
-      : "0";
-
-    const kb = (b: number) => {
-      if (b >= 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)}MB`;
-      return `${(b / 1024).toFixed(1)}KB`;
-    };
-
-    // ── Header ──
-    const lines: string[] = [
-      `## context-mode — Session Report (${uptimeMin} min)`,
-    ];
-
-    // ── Feature 1: Context Window Protection ──
-    lines.push(
-      "",
-      `### Context Window Protection`,
-      "",
-    );
-
-    if (totalCalls === 0) {
-      lines.push(`No context-mode tool calls yet. Use \`batch_execute\`, \`execute\`, or \`fetch_and_index\` to keep raw output out of your context window.`);
-    } else {
-      lines.push(
-        `| Metric | Value |`,
-        `|--------|------:|`,
-        `| Total data processed | **${kb(totalProcessed)}** |`,
-        `| Kept in sandbox (never entered context) | **${kb(keptOut)}** |`,
-        `| Entered context | ${kb(totalBytesReturned)} |`,
-        `| Estimated tokens saved | ~${Math.round(keptOut / 4).toLocaleString()} |`,
-        `| **Context savings** | **${savingsRatio.toFixed(1)}x (${reductionPct}% reduction)** |`,
-      );
-
-      // Per-tool breakdown
-      const toolNames = new Set([
-        ...Object.keys(sessionStats.calls),
-        ...Object.keys(sessionStats.bytesReturned),
-      ]);
-
-      if (toolNames.size > 0) {
-        lines.push(
-          "",
-          `| Tool | Calls | Context | Tokens |`,
-          `|------|------:|--------:|-------:|`,
-        );
-        for (const tool of Array.from(toolNames).sort()) {
-          const calls = sessionStats.calls[tool] || 0;
-          const bytes = sessionStats.bytesReturned[tool] || 0;
-          const tokens = Math.round(bytes / 4);
-          lines.push(`| ${tool} | ${calls} | ${kb(bytes)} | ~${tokens.toLocaleString()} |`);
-        }
-        lines.push(`| **Total** | **${totalCalls}** | **${kb(totalBytesReturned)}** | **~${Math.round(totalBytesReturned / 4).toLocaleString()}** |`);
-      }
-
-      if (keptOut > 0) {
-        lines.push("", `Without context-mode, **${kb(totalProcessed)}** of raw output would flood your context window. Instead, **${reductionPct}%** stayed in sandbox.`);
-      }
-
-      // Cache savings section
-      if (sessionStats.cacheHits > 0 || sessionStats.cacheBytesSaved > 0) {
-        const totalWithCache = totalProcessed + sessionStats.cacheBytesSaved;
-        const totalSavingsRatio = totalWithCache / Math.max(totalBytesReturned, 1);
-        const ttlHoursLeft = Math.max(0, 24 - Math.floor((Date.now() - sessionStats.sessionStart) / (60 * 60 * 1000)));
-        lines.push(
-          "",
-          `### TTL Cache`,
-          "",
-          `| Metric | Value |`,
-          `|--------|------:|`,
-          `| Cache hits | **${sessionStats.cacheHits}** |`,
-          `| Data avoided by cache | **${kb(sessionStats.cacheBytesSaved)}** |`,
-          `| Network requests saved | **${sessionStats.cacheHits}** |`,
-          `| TTL remaining | **~${ttlHoursLeft}h** |`,
-          "",
-          `Content was already indexed in the knowledge base — ${sessionStats.cacheHits} fetch${sessionStats.cacheHits > 1 ? "es" : ""} skipped entirely. **${kb(sessionStats.cacheBytesSaved)}** of network I/O avoided. Search results served directly from local FTS5 index.`,
-        );
-
-        // Update total savings to include cache
-        if (totalSavingsRatio > savingsRatio) {
-          lines.push("", `**Total context savings (sandbox + cache): ${totalSavingsRatio.toFixed(1)}x** — ${kb(totalWithCache)} processed, only ${kb(totalBytesReturned)} entered context.`);
-        }
-      }
-    }
-
-    // ── Session Continuity ──
+    // ONE call, ONE source — AnalyticsEngine.queryAll()
+    let text: string;
     try {
       const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
       const dbHash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
@@ -1740,226 +1656,26 @@ server.registerTool(
       if (existsSync(sessionDbPath)) {
         const Database = loadDatabase();
         const sdb = new Database(sessionDbPath, { readonly: true });
-
-        const eventTotal = sdb.prepare("SELECT COUNT(*) as cnt FROM session_events").get() as { cnt: number };
-        const byCategory = sdb.prepare(
-          "SELECT category, COUNT(*) as cnt FROM session_events GROUP BY category ORDER BY cnt DESC",
-        ).all() as Array<{ category: string; cnt: number }>;
-        const meta = sdb.prepare(
-          "SELECT compact_count FROM session_meta ORDER BY started_at DESC LIMIT 1",
-        ).get() as { compact_count: number } | undefined;
-        const resume = sdb.prepare(
-          "SELECT event_count, consumed FROM session_resume ORDER BY created_at DESC LIMIT 1",
-        ).get() as { event_count: number; consumed: number } | undefined;
-
-        if (eventTotal.cnt > 0) {
-          const compacts = meta?.compact_count ?? 0;
-
-          // Query actual data per category for preview
-          const previewRows = sdb.prepare(
-            `SELECT category, type, data FROM session_events ORDER BY id DESC`,
-          ).all() as Array<{ category: string; type: string; data: string }>;
-
-          // Build previews: unique values per category
-          const previews = new Map<string, Set<string>>();
-          for (const row of previewRows) {
-            if (!previews.has(row.category)) previews.set(row.category, new Set());
-            const set = previews.get(row.category)!;
-            if (set.size < 5) {
-              let display = row.data;
-              if (row.category === "file") {
-                display = row.data.split("/").pop() || row.data;
-              } else if (row.category === "prompt") {
-                display = display.length > 50 ? display.slice(0, 47) + "..." : display;
-              }
-              if (display.length > 40) display = display.slice(0, 37) + "...";
-              set.add(display);
-            }
-          }
-
-          const categoryLabels: Record<string, string> = {
-            file: "Files tracked",
-            rule: "Project rules (CLAUDE.md)",
-            prompt: "Your requests saved",
-            mcp: "Plugin tools used",
-            git: "Git operations",
-            env: "Environment setup",
-            error: "Errors caught",
-            task: "Tasks in progress",
-            decision: "Your decisions",
-            cwd: "Working directory",
-            skill: "Skills used",
-            subagent: "Delegated work",
-            intent: "Session mode",
-            data: "Data references",
-            role: "Behavioral directives",
-          };
-
-          const categoryHints: Record<string, string> = {
-            file: "Restored after compact — no need to re-read",
-            rule: "Your project instructions survive context resets",
-            prompt: "Continues exactly where you left off",
-            decision: "Applied automatically — won't ask again",
-            task: "Picks up from where it stopped",
-            error: "Tracked and monitored across compacts",
-            git: "Branch, commit, and repo state preserved",
-            env: "Runtime config carried forward",
-            mcp: "Tool usage patterns remembered",
-            subagent: "Delegation history preserved",
-            skill: "Skill invocations tracked",
-          };
-
-          lines.push(
-            "",
-            "### Session Continuity",
-            "",
-            "| What's preserved | Count | I remember... | Why it matters |",
-            "|------------------|------:|---------------|----------------|",
-          );
-          for (const row of byCategory) {
-            const label = categoryLabels[row.category] || row.category;
-            const preview = previews.get(row.category);
-            const previewStr = preview ? Array.from(preview).join(", ") : "";
-            const hint = categoryHints[row.category] || "Survives context resets";
-            lines.push(`| ${label} | ${row.cnt} | ${previewStr} | ${hint} |`);
-          }
-          lines.push(`| **Total** | **${eventTotal.cnt}** | | **Zero knowledge lost on compact** |`);
-
-          lines.push("");
-          if (compacts > 0) {
-            lines.push(`Context has been compacted **${compacts} time(s)** — session knowledge was preserved each time.`);
-          } else {
-            lines.push(`When your context compacts, all of this will restore Claude's awareness — no starting from scratch.`);
-          }
-          if (resume && !resume.consumed) {
-            lines.push(`Resume snapshot ready (${resume.event_count} events) for the next compaction.`);
-          }
-
-          lines.push("");
-          lines.push(`> **Note:** Previous session data is loaded when you start a new session. Without \`--continue\`, old session history is cleaned up to keep the database lean.`);
-        }
-
-        // ── Analytics ──
         try {
-          const analytics = new AnalyticsEngine(sdb);
-
-          // Get latest session_id for session-scoped metrics
-          const latestSession = sdb.prepare(
-            "SELECT session_id FROM session_meta ORDER BY started_at DESC LIMIT 1",
-          ).get() as { session_id: string } | undefined;
-
-          const sid = latestSession?.session_id ?? "";
-
-          // Session metrics
-          const durationMin = sid ? analytics.sessionDuration(sid) : null;
-          const toolCalls = sid ? (sdb.prepare(
-            "SELECT COUNT(*) as cnt FROM session_events WHERE session_id = ? AND category = 'mcp'",
-          ).get(sid) as { cnt: number }).cnt : 0;
-
-          // Activity metrics
-          const commits = sid ? analytics.commitCount(sid) : 0;
-          const errors = sid ? analytics.errorCount(sid) : 0;
-          const errorRatePct = sid ? analytics.errorRate(sid) : 0;
-          const toolDiversity = sid ? analytics.toolDiversity(sid) : 0;
-          const efficiencyScore = sid ? analytics.efficiencyScore(sid) : 0;
-          const commitsPerSessionAvg = analytics.commitsPerSession();
-          const sessionOutcome = sid ? analytics.sessionOutcome(sid) : "exploratory";
-
-          // Pattern metrics
-          const hourlyRaw = analytics.hourlyProductivity(sid || undefined);
-          const hourlyCommits = Array.from({ length: 24 }, (_, i) => {
-            const h = String(i).padStart(2, "0");
-            return hourlyRaw.find((r) => r.hour === h)?.count ?? 0;
-          });
-          const weeklyTrend = analytics.weeklyTrend();
-          const iterationCycles = sid ? analytics.iterationCycles(sid) : 0;
-          const rework = sid ? analytics.reworkRate(sid) : analytics.reworkRate();
-
-          // Health metrics
-          const claudeMdFreshness = analytics.claudeMdFreshness().map((r) => {
-            const daysAgo = r.last_updated
-              ? Math.round((Date.now() - new Date(r.last_updated).getTime()) / 86_400_000)
-              : null;
-            return { project: r.data, days_ago: daysAgo };
-          });
-          const compactionsThisWeek = sid ? analytics.compactionCount(sid) : 0;
-          const weeklySessions = analytics.weeklySessionCount();
-          const permissionDenials = sid ? analytics.permissionDenials(sid) : 0;
-
-          // Agent metrics
-          const subagents = sid
-            ? analytics.subagentUsage(sid).map((r) => ({ type: r.data, count: r.total }))
-            : [];
-          const skills = sid
-            ? analytics.skillUsage(sid).map((r) => ({ name: r.data, count: r.invocations }))
-            : [];
-
-          // Continuity total
-          const totalEvents = (sdb.prepare(
-            "SELECT COUNT(*) as cnt FROM session_events",
-          ).get() as { cnt: number }).cnt;
-
-          const analyticsJson = {
-            session: {
-              duration_min: durationMin !== null ? Math.round(durationMin * 10) / 10 : null,
-              tool_calls: toolCalls,
-            },
-            activity: {
-              commits,
-              errors,
-              error_rate_pct: errorRatePct,
-              tool_diversity: toolDiversity,
-              efficiency_score: efficiencyScore,
-              commits_per_session_avg: commitsPerSessionAvg,
-              session_outcome: sessionOutcome,
-            },
-            patterns: {
-              hourly_commits: hourlyCommits,
-              weekly_trend: weeklyTrend,
-              iteration_cycles: iterationCycles,
-              rework: rework.map((r) => ({ file: r.data, edits: r.edits })),
-            },
-            health: {
-              claude_md_freshness: claudeMdFreshness,
-              compactions_this_week: compactionsThisWeek,
-              weekly_sessions: weeklySessions,
-              permission_denials: permissionDenials,
-            },
-            agents: {
-              subagents,
-              skills,
-            },
-            continuity: { total_events: totalEvents },
-          };
-
-          lines.push(
-            "",
-            "### Analytics (27 metrics)",
-            "",
-            "```json",
-            JSON.stringify(analyticsJson, null, 2),
-            "```",
-          );
-        } catch {
-          // AnalyticsEngine failed — skip analytics section silently
+          const engine = new AnalyticsEngine(sdb);
+          const report = engine.queryAll(sessionStats);
+          text = formatReport(report);
+        } finally {
+          sdb.close();
         }
-
-        sdb.close();
+      } else {
+        // No session DB — build a minimal report from runtime stats only
+        const engine = new AnalyticsEngine(createMinimalDb());
+        const report = engine.queryAll(sessionStats);
+        text = formatReport(report);
       }
     } catch {
-      // Session DB not available or incompatible — skip silently
+      // Session DB not available or incompatible — build minimal report from runtime stats
+      const engine = new AnalyticsEngine(createMinimalDb());
+      const report = engine.queryAll(sessionStats);
+      text = formatReport(report);
     }
 
-    // No separate DevRel summary — integrated into feature sections above
-
-    // Formatting directive — ensures all LLMs display the report verbatim
-    lines.push(
-      "",
-      "---",
-      "_Display this entire report as-is in your response. Do NOT summarize, collapse, or paraphrase any section._",
-    );
-
-    const text = lines.join("\n");
     return trackResponse("ctx_stats", {
       content: [{ type: "text" as const, text }],
     });
