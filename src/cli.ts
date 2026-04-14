@@ -550,7 +550,7 @@ async function upgrade() {
     // to avoid breaking active sessions that still reference them (#181).
 
     const items = [
-      "build", "src", "hooks", "skills", "scripts", ".claude-plugin",
+      "build", "src", "hooks", "skills", "scripts", "insight", ".claude-plugin",
       "start.mjs", "server.bundle.mjs", "cli.bundle.mjs", "package.json",
     ];
     for (const item of items) {
