@@ -20,19 +20,13 @@ vi.mock("node:fs", async () => {
 
 // Imports after vi.mock so the mock is in place before detect.ts resolves fs.
 import * as fs from "node:fs";
-import { detectPlatform } from "../../src/adapters/detect.js";
+import { detectPlatform, PLATFORM_ENV_VARS } from "../../src/adapters/detect.js";
 
 const existsSyncMock = vi.mocked(fs.existsSync);
 
-const PLATFORM_ENV_VARS = [
-  "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID",
-  "GEMINI_PROJECT_DIR", "GEMINI_CLI",
-  "KILO", "KILO_PID",
-  "OPENCODE", "OPENCODE_PID",
-  "OPENCLAW_HOME", "OPENCLAW_CLI",
-  "CODEX_CI", "CODEX_THREAD_ID",
-  "CURSOR_TRACE_ID", "CURSOR_CLI",
-  "VSCODE_PID", "VSCODE_CWD",
+// Derived from detect.ts's source-of-truth list so renames can't drift.
+const ALL_PLATFORM_ENV_VARS = [
+  ...PLATFORM_ENV_VARS.flatMap(([, vars]) => [...vars]),
   "CONTEXT_MODE_PLATFORM",
 ];
 
@@ -42,7 +36,7 @@ describe("detectPlatform — config directory branches", () => {
 
   beforeEach(() => {
     savedEnv = { ...process.env };
-    for (const v of PLATFORM_ENV_VARS) delete process.env[v];
+    for (const v of ALL_PLATFORM_ENV_VARS) delete process.env[v];
     existsSyncMock.mockReset();
   });
 
@@ -119,7 +113,7 @@ describe("detectPlatform — env var priority chain", () => {
 
   beforeEach(() => {
     savedEnv = { ...process.env };
-    for (const v of PLATFORM_ENV_VARS) delete process.env[v];
+    for (const v of ALL_PLATFORM_ENV_VARS) delete process.env[v];
     existsSyncMock.mockReturnValue(false);
   });
 
