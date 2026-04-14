@@ -74,7 +74,14 @@ function sanitizeQuery(query: string, mode: "AND" | "OR" = "AND"): string {
     );
 
   if (words.length === 0) return '""';
-  return words.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+
+  // Filter stopwords to improve BM25 ranking — common terms like "update",
+  // "test", "fix" appear everywhere and dilute relevance scoring.
+  // Fall back to unfiltered words if ALL terms are stopwords.
+  const meaningful = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const final = meaningful.length > 0 ? meaningful : words;
+
+  return final.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
 }
 
 function sanitizeTrigramQuery(query: string, mode: "AND" | "OR" = "AND"): string {
@@ -82,7 +89,11 @@ function sanitizeTrigramQuery(query: string, mode: "AND" | "OR" = "AND"): string
   if (cleaned.length < 3) return "";
   const words = cleaned.split(/\s+/).filter((w) => w.length >= 3);
   if (words.length === 0) return "";
-  return words.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
+
+  const meaningful = words.filter((w) => !STOPWORDS.has(w.toLowerCase()));
+  const final = meaningful.length > 0 ? meaningful : words;
+
+  return final.map((w) => `"${w}"`).join(mode === "OR" ? " OR " : " ");
 }
 
 function levenshtein(a: string, b: string): number {
@@ -917,10 +928,14 @@ export class ContentStore {
     results: SearchResult[],
     query: string,
   ): SearchResult[] {
-    const terms = query
+    const allTerms = query
       .toLowerCase()
       .split(/\s+/)
       .filter((w) => w.length >= 2);
+    // Exclude stopwords from proximity/title scoring — they match everywhere
+    // and inflate boosts for irrelevant chunks. Keep all terms as fallback.
+    const filtered = allTerms.filter((w) => !STOPWORDS.has(w));
+    const terms = filtered.length > 0 ? filtered : allTerms;
 
     return results
       .map((r) => {
