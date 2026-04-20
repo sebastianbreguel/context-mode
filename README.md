@@ -31,6 +31,10 @@
 
 ## The Problem
 
+<p align="center">
+  <img src="docs/assets/preview-text-example.gif" alt="Split-screen: 1,200-line nginx log streaming on the left (130.4 KB), clean status-code summary appearing on the right (0.4 KB) — same answer, 325× less context" width="960">
+</p>
+
 Every MCP tool call dumps raw data into your context window. A Playwright snapshot costs 56 KB. Twenty GitHub issues cost 59 KB. One access log — 45 KB. After 30 minutes, 40% of your context is gone. And when the agent compacts the conversation to free space, it forgets which files it was editing, what tasks are in progress, and what you last asked for.
 
 Context Mode is an MCP server that solves all three sides of this problem:
@@ -968,6 +972,10 @@ The debug script collects OS info, runtime versions, better-sqlite3 status, adap
 Works on **all platforms**. On Claude Code, slash commands (`/ctx-stats`, `/ctx-doctor`, `/ctx-upgrade`, `/ctx-purge`, `/ctx-insight`) are also available.
 
 ## Benchmarks
+
+<p align="center">
+  <img src="docs/assets/preview-benchmarks.gif" alt="Six real benchmark rows animating in — red raw-output bars dwarf the tiny green context bars, closing on 937.8 KB → 80.1 KB session total" width="960">
+</p>
 
 | Scenario | Raw | Context | Saved |
 |---|---|---|---|
