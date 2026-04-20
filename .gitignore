@@ -20,6 +20,3 @@ context-mode-guidance-*/
 .claude-worktrees/
 .vibetree/
 .cw/
-scripts/benchmarks-video/node_modules/
-scripts/benchmarks-video/.tmp/
-scripts/benchmarks-video/package-lock.json
