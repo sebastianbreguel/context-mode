@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { resolve } from "node:path";
 import { describe, expect, test } from "vitest";
 import {
   resolveProjectAttribution,
@@ -10,6 +11,9 @@ import {
   type ProjectAttribution,
 } from "../../src/session/project-attribution.js";
 import type { SessionEvent } from "../../src/types.js";
+
+// Use resolved path for cross-platform tests (Windows adds drive letter)
+const TEST_BASE = resolve("/tmp/test-projects");
 
 function makeEvent(type: string, data: string, ts = Date.now()): SessionEvent {
   return { type, data, ts } as SessionEvent;
@@ -57,14 +61,15 @@ describe("resolveProjectAttribution", () => {
     });
 
     test("relative path resolved against lastKnownProjectDir", () => {
+      const projectDir = `${TEST_BASE}/project-c`.replace(/\\/g, "/");
       const event = makeEvent("file_read", "src/utils.ts");
       const result = resolveProjectAttribution(event, {
-        lastKnownProjectDir: "/Users/dev/project-c",
+        lastKnownProjectDir: projectDir,
       });
 
-      // Relative path resolves to /Users/dev/project-c/src/utils.ts
+      // Relative path resolves to {projectDir}/src/utils.ts
       // Then matches last_seen since it's under lastKnownProjectDir
-      assert.equal(result.projectDir, "/Users/dev/project-c");
+      assert.equal(result.projectDir, projectDir);
       assert.equal(result.source, "last_seen");
       assert.equal(result.confidence, 0.76);
     });
