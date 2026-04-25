@@ -9,7 +9,7 @@
 
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { join } from "node:path";
+import { join, normalize } from "node:path";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 
@@ -100,7 +100,7 @@ export const KIRO_OPTS = {
 export function resolveConfigDir(opts = CLAUDE_OPTS) {
   if (opts.configDirEnv) {
     const envVal = process.env[opts.configDirEnv];
-    if (envVal) return envVal.replace(/^~/, homedir());
+    if (envVal) return normalize(envVal.replace(/^~/, homedir()));
   }
   return join(homedir(), opts.configDir);
 }
