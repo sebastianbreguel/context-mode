@@ -8,7 +8,7 @@ import "../ensure-deps.mjs";
  * Output: { "followup_message": "" }  (empty = don't continue the loop)
  */
 
-import { readStdin, getSessionId, getSessionDBPath, getInputProjectDir, CURSOR_OPTS } from "../session-helpers.mjs";
+import { readStdin, parseStdin, getSessionId, getSessionDBPath, getInputProjectDir, CURSOR_OPTS } from "../session-helpers.mjs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createSessionLoaders } from "../session-loaders.mjs";
@@ -19,7 +19,7 @@ const OPTS = CURSOR_OPTS;
 
 try {
   const raw = await readStdin();
-  const input = JSON.parse(raw);
+  const input = parseStdin(raw);
   const projectDir = getInputProjectDir(input, CURSOR_OPTS);
 
   if (projectDir && !process.env.CURSOR_CWD) {

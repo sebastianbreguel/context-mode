@@ -35,7 +35,8 @@ beforeAll(async () => {
 
 // MCP readiness sentinel — most tests expect MCP to be ready (deny behavior).
 // Tests for graceful degradation (#230) remove sentinel explicitly.
-const mcpSentinel = resolve(tmpdir(), `context-mode-mcp-ready-${process.ppid}`);
+const _sentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
+const mcpSentinel = resolve(_sentinelDir, `context-mode-mcp-ready-${process.pid}`);
 
 beforeEach(() => {
   if (typeof resetGuidanceThrottle === "function") resetGuidanceThrottle();
@@ -437,22 +438,21 @@ describe("routePreToolUse", () => {
       expect(ROUTING_BLOCK).toContain("<file_writing_policy>");
       expect(ROUTING_BLOCK).toContain("NEVER use");
       expect(ROUTING_BLOCK).toContain("ctx_execute");
-      expect(ROUTING_BLOCK).toContain("native Write tool");
-      expect(ROUTING_BLOCK).toContain("Edit tool");
+      expect(ROUTING_BLOCK).toContain("native Write/Edit tools");
     });
 
     it("forbidden_actions blocks ctx_execute for file creation", () => {
       expect(ROUTING_BLOCK).toContain(
-        "DO NOT use",
+        "NO",
       );
       expect(ROUTING_BLOCK).toContain(
-        "to create, modify, or overwrite files",
+        "for file creation/modification",
       );
     });
 
     it("artifact_policy specifies native Write tool", () => {
       expect(ROUTING_BLOCK).toContain(
-        "Write artifacts (code, configs, PRDs) to FILES using the native Write tool",
+        "Write artifacts (code, configs, PRDs) to FILES. NEVER inline.",
       );
     });
   });

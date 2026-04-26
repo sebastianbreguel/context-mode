@@ -70,6 +70,19 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     pretooluse: "hooks/kiro/pretooluse.mjs",
     posttooluse: "hooks/kiro/posttooluse.mjs",
   },
+  "jetbrains-copilot": {
+    pretooluse: "hooks/jetbrains-copilot/pretooluse.mjs",
+    posttooluse: "hooks/jetbrains-copilot/posttooluse.mjs",
+    precompact: "hooks/jetbrains-copilot/precompact.mjs",
+    sessionstart: "hooks/jetbrains-copilot/sessionstart.mjs",
+  },
+  "qwen-code": {
+    pretooluse: "hooks/pretooluse.mjs",
+    posttooluse: "hooks/posttooluse.mjs",
+    precompact: "hooks/precompact.mjs",
+    sessionstart: "hooks/sessionstart.mjs",
+    userpromptsubmit: "hooks/userpromptsubmit.mjs",
+  },
 };
 
 async function hookDispatch(platform: string, event: string): Promise<void> {
@@ -118,6 +131,29 @@ if (args[0] === "doctor") {
 /** Normalize Windows backslash paths to forward slashes for Bash (MSYS2) compatibility. */
 export function toUnixPath(p: string): string {
   return p.replace(/\\/g, "/");
+}
+
+/**
+ * Windows-safe npm execution. On Windows:
+ * - "npm" → "npm.cmd" (Node won't resolve via PATHEXT in execFile)
+ * - shell: true required (Node v20+ CVE-2024-27980 mitigation)
+ * See: https://github.com/mksglu/context-mode/issues/344
+ */
+const isWin = process.platform === "win32";
+
+export function npmExecFile(args: string[], opts: Record<string, unknown> = {}): void {
+  execFileSync(isWin ? "npm.cmd" : "npm", args, {
+    ...opts,
+    ...(isWin ? { shell: true } : {}),
+  });
+}
+
+export function npmExec(command: string, opts: Record<string, unknown> = {}): void {
+  const { execSync: es } = require("node:child_process");
+  es(isWin ? command.replace(/^npm /, "npm.cmd ") : command, {
+    ...opts,
+    ...(isWin ? { shell: true } : {}),
+  });
 }
 
 function defaultPluginRoot(): string {
@@ -454,7 +490,7 @@ async function insight(port: number) {
   if (!existsSync(join(cacheDir, "node_modules"))) {
     console.log("Installing dependencies (first run)...");
     try {
-      execSync("npm install --production=false", { cwd: cacheDir, stdio: "inherit", timeout: 300000 });
+      npmExec("npm install --production=false", { cwd: cacheDir, stdio: "inherit", timeout: 300000 });
     } catch {
       // Clean up partial install so next run retries fresh
       try { rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true }); } catch {}
@@ -580,12 +616,12 @@ async function upgrade() {
 
     // Step 2: Install dependencies + build
     s.start("Installing dependencies & building");
-    execFileSync("npm", ["install", "--no-audit", "--no-fund"], {
+    npmExecFile(["install", "--no-audit", "--no-fund"], {
       cwd: srcDir,
       stdio: "pipe",
       timeout: 120000,
     });
-    execFileSync("npm", ["run", "build"], {
+    npmExecFile(["run", "build"], {
       cwd: srcDir,
       stdio: "pipe",
       timeout: 60000,
@@ -635,7 +671,7 @@ async function upgrade() {
 
     // Install production deps
     s.start("Installing production dependencies");
-    execFileSync("npm", ["install", "--production", "--no-audit", "--no-fund"], {
+    npmExecFile(["install", "--production", "--no-audit", "--no-fund"], {
       cwd: pluginRoot,
       stdio: "pipe",
       timeout: 60000,
@@ -646,7 +682,7 @@ async function upgrade() {
       // Rebuild native addons for current Node.js ABI (fixes #131)
       s.start("Rebuilding native addons");
       try {
-        execFileSync("npm", ["rebuild", "better-sqlite3"], {
+        npmExecFile(["rebuild", "better-sqlite3"], {
           cwd: pluginRoot,
           stdio: "pipe",
           timeout: 60000,
@@ -667,7 +703,7 @@ async function upgrade() {
     // Update global npm
     s.start("Updating npm global package");
     try {
-      execFileSync("npm", ["install", "-g", pluginRoot, "--no-audit", "--no-fund"], {
+      npmExecFile(["install", "-g", pluginRoot, "--no-audit", "--no-fund"], {
         stdio: "pipe",
         timeout: 30000,
       });

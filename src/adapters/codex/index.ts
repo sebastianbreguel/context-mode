@@ -9,24 +9,19 @@
  *   - Config: ~/.codex/hooks.json + ~/.codex/config.toml (TOML for MCP/features)
  *   - Session dir: ~/.codex/context-mode/sessions/
  *
- * IMPORTANT: Hook dispatch is NOT yet active in Codex CLI (v0.118.0).
- * codex_hooks feature flag is Stage::UnderDevelopment — hooks are implemented
- * in codex-rs/hooks/ but not wired into the tool execution pipeline.
- * Our adapter is ready; it will work once Codex enables dispatch.
- * Track: https://github.com/openai/codex/issues/16685
+ * Hook dispatch is stable in Codex CLI. PreToolUse deny decisions work,
+ * while input rewriting remains blocked on upstream updatedInput support.
+ * Track: https://github.com/openai/codex/issues/18491
  */
 
-import { createHash } from "node:crypto";
 import {
   readFileSync,
-  mkdirSync,
-  copyFileSync,
-  accessSync,
-  constants,
 } from "node:fs";
-import { resolve, join, dirname } from "node:path";
+import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+
+import { BaseAdapter } from "../base.js";
 
 import type {
   HookAdapter,
@@ -67,7 +62,11 @@ interface CodexHookInput {
 // Adapter implementation
 // ─────────────────────────────────────────────────────────
 
-export class CodexAdapter implements HookAdapter {
+export class CodexAdapter extends BaseAdapter implements HookAdapter {
+  constructor() {
+    super([".codex"]);
+  }
+
   readonly name = "Codex CLI";
   readonly paradigm: HookParadigm = "json-stdio";
 
@@ -207,33 +206,11 @@ export class CodexAdapter implements HookAdapter {
     return resolve(homedir(), ".codex", "config.toml");
   }
 
-  getSessionDir(): string {
-    const dir = join(homedir(), ".codex", "context-mode", "sessions");
-    mkdirSync(dir, { recursive: true });
-    return dir;
-  }
-
-  getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
-  }
-
-  getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
-  }
-
   generateHookConfig(pluginRoot: string): HookRegistration {
     return {
       PreToolUse: [
         {
-          matcher: "",
+          matcher: "local_shell|shell|shell_command|exec_command|container.exec|Bash|Shell|grep_files|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute",
           hooks: [
             {
               type: "command",
@@ -292,9 +269,9 @@ export class CodexAdapter implements HookAdapter {
     return [
       {
         check: "Hook support",
-        status: "warn",
+        status: "pass",
         message:
-          "Codex CLI hooks are implemented but dispatch is not yet active (Stage::UnderDevelopment, v0.118.0). Enable flag: [features] codex_hooks = true in ~/.codex/config.toml. Track: openai/codex#16685",
+          "Codex CLI hooks are stable. Configure ~/.codex/hooks.json for PreToolUse, PostToolUse, and SessionStart.",
       },
     ];
   }
@@ -352,17 +329,7 @@ export class CodexAdapter implements HookAdapter {
     return [];
   }
 
-  backupSettings(): string | null {
-    const settingsPath = this.getSettingsPath();
-    try {
-      accessSync(settingsPath, constants.R_OK);
-      const backupPath = settingsPath + ".bak";
-      copyFileSync(settingsPath, backupPath);
-      return backupPath;
-    } catch {
-      return null;
-    }
-  }
+
 
   setHookPermissions(_pluginRoot: string): string[] {
     // Hook permissions are set during plugin install

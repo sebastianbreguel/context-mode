@@ -40,7 +40,8 @@ export interface AnalyticsData {
   exploreExecRatio: { explore: number; execute: number; total: number };
   reworkData: { session_id: string; file: string; edit_count: number }[];
   gitActivity: { action: string; created_at: string; session_id: string; project_dir: string; session_start: string }[];
-  projectActivity: { project_dir: string; sessions: number; events: number }[];
+  projectActivity: { project_dir: string; sessions: number; events: number; avg_confidence?: number; high_conf_events?: number }[];
+  attribution?: { totalEvents: number; attributedEvents: number; unknownEvents: number; unknownPct: number; avgConfidencePct: number; highConfidencePct: number; isFallbackOnly: boolean };
   hourlyPattern: { hour: number; count: number }[];
   weeklyTrend: { week: string; sessions: number; events: number }[];
   tasks: { task: string; created_at: string }[];

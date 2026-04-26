@@ -121,9 +121,9 @@ function Sessions() {
           }
 
           // Project name: last 2 path segments
-          const projectName = s.projectDir
-            ? s.projectDir.split("/").filter(Boolean).slice(-2).join("/")
-            : "Unknown";
+          const projectName = !s.projectDir || s.projectDir === "__unknown__"
+            ? "Unknown"
+            : s.projectDir.split("/").filter(Boolean).slice(-2).join("/") || "Unknown";
 
           return (
             <Link

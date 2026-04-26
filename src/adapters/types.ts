@@ -283,11 +283,13 @@ export type PlatformId =
   | "openclaw"
   | "codex"
   | "vscode-copilot"
+  | "jetbrains-copilot"
   | "cursor"
   | "antigravity"
   | "kiro"
   | "pi"
   | "zed"
+  | "qwen-code"
   | "unknown";
 
 /** Detection signal used to identify which platform is running. */

@@ -18,6 +18,7 @@ import {
 } from "../session-directive.mjs";
 import {
   readStdin,
+  parseStdin,
   getSessionId,
   getSessionDBPath,
   getSessionEventsPath,
@@ -37,7 +38,7 @@ let additionalContext = ROUTING_BLOCK;
 
 try {
   const raw = await readStdin();
-  const input = JSON.parse(raw);
+  const input = parseStdin(raw);
   const source = input.source ?? input.trigger ?? "startup";
   const projectDir = getInputProjectDir(input, CURSOR_OPTS);
 

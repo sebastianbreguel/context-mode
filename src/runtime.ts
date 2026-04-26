@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 
 export type Language =
@@ -49,18 +49,32 @@ function commandExists(cmd: string): boolean {
 
 function bunExists(): boolean {
   if (commandExists("bun")) return true;
-  // Bun installs to ~/.bun/bin which may not be in PATH in MCP server environments
-  if (!isWindows) {
-    const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-    if (home && existsSync(`${home}/.bun/bin/bun`)) return true;
+  for (const p of bunFallbackPaths()) {
+    if (existsSync(p)) return true;
   }
   return false;
 }
 
 function bunCommand(): string {
   if (commandExists("bun")) return "bun";
+  for (const p of bunFallbackPaths()) {
+    if (existsSync(p)) return p;
+  }
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  return `${home}/.bun/bin/bun`;
+  return isWindows ? `${home}\\.bun\\bin\\bun.exe` : `${home}/.bun/bin/bun`;
+}
+
+/** Fallback paths where Bun may be installed but not on PATH. */
+function bunFallbackPaths(): string[] {
+  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
+  if (isWindows) {
+    const localAppData = process.env.LOCALAPPDATA ?? "";
+    return [
+      ...(home ? [`${home}\\.bun\\bin\\bun.exe`] : []),
+      ...(localAppData ? [`${localAppData}\\bun\\bin\\bun.exe`] : []),
+    ];
+  }
+  return home ? [`${home}/.bun/bin/bun`] : [];
 }
 
 /**
@@ -95,10 +109,11 @@ function resolveWindowsBash(): string | null {
   }
 }
 
-function getVersion(cmd: string): string {
+function getVersion(cmd: string, args: string[] = ["--version"]): string {
   try {
-    return execSync(`${cmd} --version`, {
+    return execFileSync(cmd, args, {
       encoding: "utf-8",
+      shell: process.platform === "win32",
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 5000,
     })
@@ -184,7 +199,7 @@ export function getRuntimeSummary(runtimes: RuntimeMap): string {
       `  Ruby:       ${runtimes.ruby} (${getVersion(runtimes.ruby)})`,
     );
   if (runtimes.go)
-    lines.push(`  Go:         ${runtimes.go} (${getVersion(runtimes.go)})`);
+    lines.push(`  Go:         ${runtimes.go} (${getVersion(runtimes.go, ["version"])})`);
   if (runtimes.rust)
     lines.push(
       `  Rust:       ${runtimes.rust} (${getVersion(runtimes.rust)})`,

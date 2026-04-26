@@ -3,9 +3,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
-import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, rmSync, mkdirSync, cpSync, statSync } from "node:fs";
-import { execSync } from "node:child_process";
-import { join, dirname, resolve } from "node:path";
+import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
+import { execSync, type ChildProcess } from "node:child_process";
+import { join, dirname, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { request as httpsRequest } from "node:https";
@@ -115,6 +115,10 @@ function maybeIndexSessionEvents(store: ContentStore): void {
 // hardcoded configDir detection in tool handlers.
 
 let _detectedAdapter: HookAdapter | null = null;
+
+// Tracks the ctx_insight dashboard child so shutdown can terminate it.
+// See ctx_insight handler + shutdown() in main().
+let _insightChild: ChildProcess | null = null;
 
 /**
  * Get the platform-specific sessions directory from the detected adapter.
@@ -260,9 +264,19 @@ function getUpgradeHint(): string {
   return "npm update -g context-mode";
 }
 
+function semverNewer(a: string, b: string): boolean {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true;
+    if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false;
+  }
+  return false;
+}
+
 function isOutdated(): boolean {
   if (!_latestVersion || _latestVersion === "unknown") return false;
-  return _latestVersion !== VERSION;
+  return semverNewer(_latestVersion, VERSION);
 }
 
 function shouldShowVersionWarning(): boolean {
@@ -278,7 +292,43 @@ function shouldShowVersionWarning(): boolean {
   return true;
 }
 
+// ── Self-heal Layer 2: Mid-session registry heal (anthropics/claude-code#46915) ──
+// Runs once on first tool call. If Claude Code auto-updated the registry mid-session,
+// hooks break because CLAUDE_PLUGIN_ROOT points to a deleted directory. We create a
+// symlink from the broken path to our actual directory so hooks recover.
+let _cacheHealDone = false;
+function healCacheMidSession(): void {
+  if (_cacheHealDone) return;
+  _cacheHealDone = true;
+  try {
+    const ipPath = resolve(homedir(), ".claude", "plugins", "installed_plugins.json");
+    if (!existsSync(ipPath)) return;
+    const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
+    const cacheRoot = resolve(homedir(), ".claude", "plugins", "cache");
+    // Plugin root: build/ for tsc, plugin root for bundle
+    const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
+    for (const [key, entries] of Object.entries((ip.plugins ?? {}) as Record<string, Array<{ installPath?: string }>>)) {
+      if (key !== "context-mode@context-mode") continue;
+      for (const entry of entries) {
+        const rp = entry.installPath;
+        if (!rp || existsSync(rp)) continue;
+        // Path traversal guard
+        if (!resolve(rp).startsWith(cacheRoot + sep)) continue;
+        // Remove dangling symlink
+        try { if (lstatSync(rp).isSymbolicLink()) unlinkSync(rp); } catch {}
+        const parent = dirname(rp);
+        if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
+        if (existsSync(pluginRoot)) {
+          symlinkSync(pluginRoot, rp, process.platform === "win32" ? "junction" : undefined);
+        }
+      }
+    }
+  } catch { /* best effort */ }
+}
+
 function trackResponse(toolName: string, response: ToolResult): ToolResult {
+  // Mid-session cache heal — one-shot, first tool call
+  healCacheMidSession();
   // Prepend version outdated warning if needed
   if (shouldShowVersionWarning() && response.content.length > 0) {
     const hint = getUpgradeHint();
@@ -371,8 +421,14 @@ function checkFilePathDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const denyGlobs = readToolDenyPatterns("Read", process.env.CLAUDE_PROJECT_DIR);
-    const result = evaluateFilePath(filePath, denyGlobs);
+    const projectDir = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+    const denyGlobs = readToolDenyPatterns("Read", projectDir);
+    const result = evaluateFilePath(
+      filePath,
+      denyGlobs,
+      process.platform === "win32",
+      projectDir,
+    );
     if (result.denied) {
       return trackResponse(toolName, {
         content: [{
@@ -560,7 +616,7 @@ server.registerTool(
   "ctx_execute",
   {
     title: "Execute Code",
-    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.`,
+    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.\n\nWhen reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].`,
     inputSchema: z.object({
       language: z
         .enum([
@@ -891,7 +947,7 @@ server.registerTool(
   {
     title: "Execute File Processing",
     description:
-      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.",
+      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.\n\nWhen reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
       path: z
         .string()
@@ -1048,6 +1104,7 @@ server.registerTool(
       "- README files, migration guides, changelog entries\n" +
       "- Any content with code examples you may need to reference precisely\n\n" +
       "After indexing, use 'search' to retrieve specific sections on-demand.\n" +
+      "When `path` is provided, a content hash is stored for automatic stale detection in search results.\n" +
       "Do NOT use for: log files, test output, CSV, build output — use 'execute_file' for those.",
     inputSchema: z.object({
       content: z
@@ -1162,8 +1219,10 @@ server.registerTool(
     title: "Search Indexed Content",
     description:
       "Search indexed content. Requires prior indexing via ctx_batch_execute, ctx_index, or ctx_fetch_and_index. " +
-      "Pass ALL search questions as queries array in ONE call.\n\n" +
-      "TIPS: 2-4 specific terms per query. Use 'source' to scope results.",
+      "Pass ALL search questions as queries array in ONE call. " +
+      "File-backed sources are auto-refreshed when the source file changes.\n\n" +
+      "TIPS: 2-4 specific terms per query. Use 'source' to scope results.\n\n" +
+      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
@@ -1282,6 +1341,11 @@ server.registerTool(
       }
 
       let output = sections.join("\n\n---\n\n");
+
+      // Report auto-refreshed stale sources
+      if (store.lastRefreshCount > 0) {
+        output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""} (file changed since indexing).\n\n` + output;
+      }
 
       // Add throttle warning after threshold
       if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
@@ -1404,7 +1468,8 @@ server.registerTool(
       "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
       "and returns a ~3KB preview. Full content stays in sandbox — use search() for deeper lookups.\n\n" +
       "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.\n\n" +
-      "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.",
+      "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.\n\n" +
+      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
       url: z.string().describe("The URL to fetch and index"),
       source: z
@@ -1565,7 +1630,8 @@ server.registerTool(
       "THIS IS THE PRIMARY TOOL. Use this instead of multiple execute() calls.\n\n" +
       "One batch_execute call replaces 30+ execute calls + 10+ search calls.\n" +
       "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
-      "THINK IN CODE: When commands produce data you need to analyze, add processing commands that filter and summarize. Don't pull raw output into context — let the sandbox do the work.",
+      "THINK IN CODE: When commands produce data you need to analyze, add processing commands that filter and summarize. Don't pull raw output into context — let the sandbox do the work.\n\n" +
+      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -1908,6 +1974,23 @@ server.registerTool(
     const bundlePath = resolve(pluginRoot, "cli.bundle.mjs");
     const fallbackPath = resolve(pluginRoot, "build", "cli.js");
 
+    // Clean up insight-cache on upgrade so next ctx_insight does fresh build
+    try {
+      const sessDir = getSessionDir();
+      const insightCacheDir = join(dirname(sessDir), "insight-cache");
+      if (existsSync(insightCacheDir)) {
+        // Kill any running insight server first
+        try {
+          if (process.platform === "win32") {
+            execSync('for /f "tokens=5" %a in (\'netstat -ano ^| findstr :4747\') do taskkill /F /PID %a', { stdio: "pipe" });
+          } else {
+            execSync("lsof -ti:4747 | xargs kill 2>/dev/null", { stdio: "pipe" });
+          }
+        } catch { /* no process to kill */ }
+        rmSync(insightCacheDir, { recursive: true, force: true });
+      }
+    } catch { /* best effort — don't block upgrade */ }
+
     let cmd: string;
 
     if (existsSync(bundlePath)) {
@@ -1934,8 +2017,8 @@ server.registerTool(
         `console.log("- [x] Starting inline upgrade (no CLI found)");`,
         `execFileSync("git",["clone","--depth","1","${repoUrl}",T],{stdio:"inherit"});`,
         `console.log("- [x] Cloned latest source");`,
-        `execFileSync("npm",["install"],{cwd:T,stdio:"inherit"});`,
-        `execFileSync("npm",["run","build"],{cwd:T,stdio:"inherit"});`,
+        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
+        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["run","build"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Built from source");`,
         ...copyDirs.map(
           (d) =>
@@ -1946,7 +2029,7 @@ server.registerTool(
             `if(existsSync(join(T,${JSON.stringify(f)})))cpSync(join(T,${JSON.stringify(f)}),join(P,${JSON.stringify(f)}),{force:true});`,
         ),
         `console.log("- [x] Copied build artifacts");`,
-        `execFileSync("npm",["install","--production"],{cwd:P,stdio:"inherit"});`,
+        `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install","--production"],{cwd:P,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Installed production dependencies");`,
         `console.log("## context-mode upgrade complete");`,
         `}catch(e){`,
@@ -2115,6 +2198,7 @@ server.registerTool(
 
     try {
       const steps: string[] = [];
+      let sourceUpdated = false;
 
       // Ensure cache dir
       mkdirSync(cacheDir, { recursive: true });
@@ -2128,14 +2212,15 @@ server.registerTool(
         steps.push("Copying source files...");
         cpSync(insightSource, cacheDir, { recursive: true, force: true });
         steps.push("Source files copied.");
+        sourceUpdated = true;
       }
 
-      // Install deps if needed
+      // Install deps if needed (also reinstall when source updated and package.json may have changed)
       const hasNodeModules = existsSync(join(cacheDir, "node_modules"));
-      if (!hasNodeModules) {
+      if (!hasNodeModules || sourceUpdated) {
         steps.push("Installing dependencies (first run, ~30s)...");
         try {
-          execSync("npm install --production=false", {
+          execSync(process.platform === "win32" ? "npm.cmd install --production=false" : "npm install --production=false", {
             cwd: cacheDir,
             stdio: "pipe",
             timeout: 300000,
@@ -2162,7 +2247,8 @@ server.registerTool(
       });
       steps.push("Build complete.");
 
-      // Pre-check: is port already in use? (prevents orphan zombie processes)
+      // Pre-check: is port already in use?
+      let portOccupied = false;
       try {
         const { request } = await import("node:http");
         await new Promise<void>((resolve, reject) => {
@@ -2174,9 +2260,26 @@ server.registerTool(
           req.on("timeout", () => { req.destroy(); reject(); });
           req.end();
         });
-        // If we get here, port is already responding
+        portOccupied = true;
+      } catch {
+        // Port is free, proceed with spawn
+      }
+
+      if (portOccupied && sourceUpdated) {
+        // Source was updated but stale server is running on port — kill it so fresh code runs
+        steps.push("Killing stale dashboard server (source updated)...");
+        try {
+          if (process.platform === "win32") {
+            execSync(`for /f "tokens=5" %a in ('netstat -ano ^| findstr :${port}') do taskkill /F /PID %a`, { stdio: "pipe" });
+          } else {
+            execSync(`lsof -ti:${port} | xargs kill 2>/dev/null`, { stdio: "pipe" });
+          }
+          await new Promise(r => setTimeout(r, 500)); // Wait for port to free
+        } catch { /* no process to kill — proceed anyway */ }
+        steps.push("Stale server killed.");
+      } else if (portOccupied) {
+        // Source unchanged, server is running fine — just open browser
         steps.push("Dashboard already running.");
-        // Open browser anyway
         const url = `http://localhost:${port}`;
         const platform = process.platform;
         try {
@@ -2187,11 +2290,17 @@ server.registerTool(
         return trackResponse("ctx_insight", {
           content: [{ type: "text" as const, text: `Dashboard already running at http://localhost:${port}` }],
         });
-      } catch {
-        // Port is free, proceed with spawn
       }
 
-      // Start server in background
+      // Kill any previous insight child this MCP spawned (e.g. re-invocation).
+      if (_insightChild && _insightChild.pid && !_insightChild.killed) {
+        try { _insightChild.kill("SIGTERM"); } catch { /* best effort */ }
+      }
+
+      // Start server in background. `detached: true` keeps MCP stdio free, but
+      // we track the handle and kill it in shutdown() so the dashboard does
+      // not orphan when Claude closes. The child also watches INSIGHT_PARENT_PID
+      // as a fallback for SIGKILL/crash paths.
       const { spawn } = await import("node:child_process");
       const child = spawn("node", [join(cacheDir, "server.mjs")], {
         cwd: cacheDir,
@@ -2200,12 +2309,14 @@ server.registerTool(
           PORT: String(port),
           INSIGHT_SESSION_DIR: getSessionDir(),
           INSIGHT_CONTENT_DIR: join(dirname(getSessionDir()), "content"),
+          INSIGHT_PARENT_PID: String(process.pid),
         },
         detached: true,
         stdio: "ignore",
       });
       child.on("error", () => {}); // prevent unhandled error crash
       child.unref();
+      _insightChild = child;
 
       // Wait for server to be ready
       await new Promise(r => setTimeout(r, 1500));
@@ -2269,8 +2380,11 @@ async function main() {
     console.error(`Cleaned up ${cleaned} stale DB file(s) from previous sessions`);
   }
 
-  // MCP readiness sentinel path (#230)
-  const mcpSentinel = join(tmpdir(), `context-mode-mcp-ready-${process.ppid}`);
+  // MCP readiness sentinel path (#230, #347)
+  // Uses process.pid (not ppid) — hooks use directory-scan to find any live sentinel.
+  // Hardcoded /tmp on Unix to avoid TMPDIR mismatch (#347).
+  const mcpSentinelDir = process.platform === "win32" ? tmpdir() : "/tmp";
+  const mcpSentinel = join(mcpSentinelDir, `context-mode-mcp-ready-${process.pid}`);
 
   // Clean up own DB + backgrounded processes + preload script on shutdown
   const shutdown = () => {
@@ -2279,6 +2393,10 @@ async function main() {
     try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ }
     // Remove MCP readiness sentinel (#230)
     try { unlinkSync(mcpSentinel); } catch { /* best effort */ }
+    // Stop ctx_insight dashboard so it does not outlive Claude.
+    if (_insightChild && _insightChild.pid && !_insightChild.killed) {
+      try { _insightChild.kill("SIGTERM"); } catch { /* best effort */ }
+    }
   };
   const gracefulShutdown = async () => {
     shutdown();

@@ -46,6 +46,7 @@ function getWorktreeSuffix() {
 /** Claude Code platform options (default). */
 const CLAUDE_OPTS = {
   configDir: ".claude",
+  configDirEnv: "CLAUDE_CONFIG_DIR",
   projectDirEnv: "CLAUDE_PROJECT_DIR",
   sessionIdEnv: "CLAUDE_SESSION_ID",
 };
@@ -53,6 +54,7 @@ const CLAUDE_OPTS = {
 /** Gemini CLI platform options. */
 export const GEMINI_OPTS = {
   configDir: ".gemini",
+  configDirEnv: "GEMINI_CLI_HOME",
   projectDirEnv: "GEMINI_PROJECT_DIR",
   sessionIdEnv: undefined,
 };
@@ -60,6 +62,7 @@ export const GEMINI_OPTS = {
 /** VS Code Copilot platform options. */
 export const VSCODE_OPTS = {
   configDir: ".vscode",
+  configDirEnv: undefined,
   projectDirEnv: "VSCODE_CWD",
   sessionIdEnv: undefined,
 };
@@ -67,6 +70,7 @@ export const VSCODE_OPTS = {
 /** Cursor platform options. */
 export const CURSOR_OPTS = {
   configDir: ".cursor",
+  configDirEnv: undefined,
   projectDirEnv: "CURSOR_CWD",
   sessionIdEnv: "CURSOR_SESSION_ID",
 };
@@ -74,6 +78,7 @@ export const CURSOR_OPTS = {
 /** Codex CLI platform options. */
 export const CODEX_OPTS = {
   configDir: ".codex",
+  configDirEnv: "CODEX_HOME",
   projectDirEnv: undefined,   // Codex passes cwd in hook stdin, no env var
   sessionIdEnv: undefined,    // Uses session_id from hook stdin or ppid fallback
 };
@@ -81,9 +86,45 @@ export const CODEX_OPTS = {
 /** Kiro CLI platform options. */
 export const KIRO_OPTS = {
   configDir: ".kiro",
+  configDirEnv: undefined,
   projectDirEnv: undefined,   // Kiro CLI provides cwd in hook stdin, no env var
   sessionIdEnv: undefined,    // No session ID env var — uses ppid fallback
 };
+
+/** JetBrains Copilot platform options. */
+export const JETBRAINS_OPTS = {
+  configDir: ".config/JetBrains",
+  configDirEnv: undefined,
+  projectDirEnv: "IDEA_INITIAL_DIRECTORY",
+  sessionIdEnv: undefined,
+};
+
+/**
+ * Resolve the platform config directory, respecting env var overrides.
+ * Platforms like Claude Code (CLAUDE_CONFIG_DIR), Gemini CLI (GEMINI_CLI_HOME),
+ * and Codex CLI (CODEX_HOME) allow users to customize the config location.
+ * Falls back to ~/<configDir> when no env var is set.
+ */
+export function resolveConfigDir(opts = CLAUDE_OPTS) {
+  if (opts.configDirEnv) {
+    const envVal = process.env[opts.configDirEnv];
+    if (envVal) {
+      if (envVal.startsWith("~")) return join(homedir(), envVal.replace(/^~[/\\]?/, ""));
+      return envVal;
+    }
+  }
+  return join(homedir(), opts.configDir);
+}
+
+/**
+ * Safely parse raw stdin string as JSON.
+ * Returns empty object for empty/whitespace/BOM-only input instead of throwing.
+ * Strips BOM prefix before parsing. Throws on genuinely malformed JSON.
+ */
+export function parseStdin(raw) {
+  const cleaned = raw.replace(/^\uFEFF/, "").trim();
+  return cleaned ? JSON.parse(cleaned) : {};
+}
 
 /**
  * Read all of stdin as a string (event-based, cross-platform safe).
@@ -147,7 +188,7 @@ export function getSessionId(input, opts = CLAUDE_OPTS) {
 export function getSessionDBPath(opts = CLAUDE_OPTS) {
   const projectDir = getProjectDir(opts);
   const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
-  const dir = join(homedir(), opts.configDir, "context-mode", "sessions");
+  const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return join(dir, `${hash}${getWorktreeSuffix()}.db`);
 }
@@ -160,7 +201,7 @@ export function getSessionDBPath(opts = CLAUDE_OPTS) {
 export function getSessionEventsPath(opts = CLAUDE_OPTS) {
   const projectDir = getProjectDir(opts);
   const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
-  const dir = join(homedir(), opts.configDir, "context-mode", "sessions");
+  const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return join(dir, `${hash}${getWorktreeSuffix()}-events.md`);
 }
@@ -173,7 +214,7 @@ export function getSessionEventsPath(opts = CLAUDE_OPTS) {
 export function getCleanupFlagPath(opts = CLAUDE_OPTS) {
   const projectDir = getProjectDir(opts);
   const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
-  const dir = join(homedir(), opts.configDir, "context-mode", "sessions");
+  const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return join(dir, `${hash}${getWorktreeSuffix()}.cleanup`);
 }

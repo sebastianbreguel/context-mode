@@ -1,47 +1,35 @@
 /**
  * adapters/claude-code — Claude Code platform adapter.
  *
- * Implements HookAdapter for Claude Code's JSON stdin/stdout hook paradigm.
+ * Extends ClaudeCodeBaseAdapter (shared wire-protocol parse/format methods)
+ * with Claude Code-specific configuration, diagnostics, and upgrade logic.
  *
  * Claude Code hook specifics:
- *   - I/O: JSON on stdin, JSON on stdout
- *   - Arg modification: `updatedInput` field in response
- *   - Blocking: `permissionDecision: "deny"` in response
- *   - PostToolUse output: `updatedMCPToolOutput` field
- *   - PreCompact: stdout on exit 0
  *   - Session ID: transcript_path UUID > session_id > CLAUDE_SESSION_ID > ppid
  *   - Config: ~/.claude/settings.json
  *   - Session dir: ~/.claude/context-mode/sessions/
+ *   - Plugin registry: ~/.claude/plugins/installed_plugins.json
  */
 
-import { createHash } from "node:crypto";
 import {
   readFileSync,
   writeFileSync,
-  mkdirSync,
-  copyFileSync,
-  accessSync,
   existsSync,
   readdirSync,
   chmodSync,
+  accessSync,
   constants,
 } from "node:fs";
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
+
+import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
 
 import type {
   HookAdapter,
   HookParadigm,
   PlatformCapabilities,
   DiagnosticResult,
-  PreToolUseEvent,
-  PostToolUseEvent,
-  PreCompactEvent,
-  SessionStartEvent,
-  PreToolUseResponse,
-  PostToolUseResponse,
-  PreCompactResponse,
-  SessionStartResponse,
   HookRegistration,
 } from "../types.js";
 import {
@@ -57,26 +45,17 @@ import {
 } from "./hooks.js";
 
 // ─────────────────────────────────────────────────────────
-// Claude Code raw input types
-// ─────────────────────────────────────────────────────────
-
-interface ClaudeCodeHookInput {
-  tool_name?: string;
-  tool_input?: Record<string, unknown>;
-  tool_output?: string;
-  is_error?: boolean;
-  session_id?: string;
-  transcript_path?: string;
-  source?: string;
-}
-
-// ─────────────────────────────────────────────────────────
 // Adapter implementation
 // ─────────────────────────────────────────────────────────
 
-export class ClaudeCodeAdapter implements HookAdapter {
+export class ClaudeCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapter {
+  constructor() {
+    super([".claude"]);
+  }
+
   readonly name = "Claude Code";
   readonly paradigm: HookParadigm = "json-stdio";
+  protected readonly projectDirEnvVar = "CLAUDE_PROJECT_DIR";
 
   readonly capabilities: PlatformCapabilities = {
     preToolUse: true,
@@ -88,139 +67,10 @@ export class ClaudeCodeAdapter implements HookAdapter {
     canInjectSessionContext: true,
   };
 
-  // ── Input parsing ──────────────────────────────────────
-
-  parsePreToolUseInput(raw: unknown): PreToolUseEvent {
-    const input = raw as ClaudeCodeHookInput;
-    return {
-      toolName: input.tool_name ?? "",
-      toolInput: input.tool_input ?? {},
-      sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  parsePostToolUseInput(raw: unknown): PostToolUseEvent {
-    const input = raw as ClaudeCodeHookInput;
-    return {
-      toolName: input.tool_name ?? "",
-      toolInput: input.tool_input ?? {},
-      toolOutput: input.tool_output,
-      isError: input.is_error,
-      sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  parsePreCompactInput(raw: unknown): PreCompactEvent {
-    const input = raw as ClaudeCodeHookInput;
-    return {
-      sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  parseSessionStartInput(raw: unknown): SessionStartEvent {
-    const input = raw as ClaudeCodeHookInput;
-    const rawSource = input.source ?? "startup";
-
-    let source: SessionStartEvent["source"];
-    switch (rawSource) {
-      case "compact":
-        source = "compact";
-        break;
-      case "resume":
-        source = "resume";
-        break;
-      case "clear":
-        source = "clear";
-        break;
-      default:
-        source = "startup";
-    }
-
-    return {
-      sessionId: this.extractSessionId(input),
-      source,
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
-      raw,
-    };
-  }
-
-  // ── Response formatting ────────────────────────────────
-
-  formatPreToolUseResponse(response: PreToolUseResponse): unknown {
-    if (response.decision === "deny") {
-      return {
-        permissionDecision: "deny",
-        reason: response.reason ?? "Blocked by context-mode hook",
-      };
-    }
-    if (response.decision === "modify" && response.updatedInput) {
-      return { updatedInput: response.updatedInput };
-    }
-    if (response.decision === "context" && response.additionalContext) {
-      // Claude Code: inject additionalContext into model context
-      return { additionalContext: response.additionalContext };
-    }
-    if (response.decision === "ask") {
-      // Claude Code: native "ask" — prompt user for permission
-      return { permissionDecision: "ask" };
-    }
-    // "allow" — return null/undefined for passthrough
-    return undefined;
-  }
-
-  formatPostToolUseResponse(response: PostToolUseResponse): unknown {
-    const result: Record<string, unknown> = {};
-    if (response.additionalContext) {
-      result.additionalContext = response.additionalContext;
-    }
-    if (response.updatedOutput) {
-      result.updatedMCPToolOutput = response.updatedOutput;
-    }
-    return Object.keys(result).length > 0 ? result : undefined;
-  }
-
-  formatPreCompactResponse(response: PreCompactResponse): unknown {
-    // Claude Code: stdout content on exit 0 is injected as context
-    return response.context ?? "";
-  }
-
-  formatSessionStartResponse(response: SessionStartResponse): unknown {
-    // Claude Code: stdout content is injected as additional context
-    return response.context ?? "";
-  }
-
   // ── Configuration ──────────────────────────────────────
 
   getSettingsPath(): string {
     return resolve(homedir(), ".claude", "settings.json");
-  }
-
-  getSessionDir(): string {
-    const dir = join(homedir(), ".claude", "context-mode", "sessions");
-    mkdirSync(dir, { recursive: true });
-    return dir;
-  }
-
-  getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
-  }
-
-  getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
@@ -627,18 +477,6 @@ export class ClaudeCodeAdapter implements HookAdapter {
     return changes;
   }
 
-  backupSettings(): string | null {
-    const settingsPath = this.getSettingsPath();
-    try {
-      accessSync(settingsPath, constants.R_OK);
-      const backupPath = settingsPath + ".bak";
-      copyFileSync(settingsPath, backupPath);
-      return backupPath;
-    } catch {
-      return null;
-    }
-  }
-
   setHookPermissions(pluginRoot: string): string[] {
     const set: string[] = [];
     for (const [, scriptName] of Object.entries(HOOK_SCRIPTS)) {
@@ -677,13 +515,10 @@ export class ClaudeCodeAdapter implements HookAdapter {
     }
   }
 
-  // ── Internal helpers ───────────────────────────────────
+  // ── Session ID extraction ───────────────────────────────
+  // Claude Code priority: transcript_path UUID > session_id > CLAUDE_SESSION_ID > ppid
 
-  /**
-   * Extract session ID from Claude Code hook input.
-   * Priority: transcript_path UUID > session_id field > CLAUDE_SESSION_ID env > ppid fallback.
-   */
-  private extractSessionId(input: ClaudeCodeHookInput): string {
+  protected extractSessionId(input: ClaudeCodeWireInput): string {
     if (input.transcript_path) {
       const match = input.transcript_path.match(
         /([a-f0-9-]{36})\.jsonl$/,
