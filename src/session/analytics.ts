@@ -121,6 +121,12 @@ export interface FullReport {
     compact_count: number;
     resume_ready: boolean;
   };
+  /** Persistent project memory — all events across all sessions */
+  projectMemory: {
+    total_events: number;
+    session_count: number;
+    by_category: Array<{ category: string; count: number; label: string }>;
+  };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -342,6 +348,23 @@ export class AnalyticsEngine {
       why: categoryHints[row.category] || "Survives context resets",
     }));
 
+    // ── Project-wide persistent memory (all sessions, no session_id filter) ──
+    const projectTotals = this.db.prepare(
+      "SELECT COUNT(*) as cnt, COUNT(DISTINCT session_id) as sessions FROM session_events",
+    ).get() as { cnt: number; sessions: number };
+
+    const projectByCategory = this.db.prepare(
+      "SELECT category, COUNT(*) as cnt FROM session_events GROUP BY category ORDER BY cnt DESC",
+    ).all() as Array<{ category: string; cnt: number }>;
+
+    const projectMemoryByCategory = projectByCategory
+      .filter((row) => row.cnt > 0)
+      .map((row) => ({
+        category: row.category,
+        count: row.cnt,
+        label: categoryLabels[row.category] || row.category,
+      }));
+
     return {
       savings: {
         processed_kb: Math.round(totalProcessed / 1024 * 10) / 10,
@@ -365,6 +388,11 @@ export class AnalyticsEngine {
         by_category: continuityByCategory,
         compact_count: compactCount,
         resume_ready: resumeReady,
+      },
+      projectMemory: {
+        total_events: projectTotals.cnt,
+        session_count: projectTotals.sessions,
+        by_category: projectMemoryByCategory,
       },
     };
   }
@@ -409,15 +437,32 @@ function dataBar(bytes: number, maxBytes: number, width: number = 40): string {
 }
 
 /**
+ * Render project memory section with category bars.
+ * Shows persistent event data across all sessions.
+ */
+function renderProjectMemory(pm: FullReport["projectMemory"]): string[] {
+  if (pm.total_events === 0) return [];
+  const out: string[] = [];
+  out.push("");
+  const sessionLabel = pm.session_count === 1 ? "1 session" : `${pm.session_count} sessions`;
+  out.push(`${fmtNum(pm.total_events)} events remembered across ${sessionLabel} \u2014 searchable after compact & restart`);
+  out.push("");
+  const maxCount = pm.by_category.length > 0 ? pm.by_category[0].count : 1;
+  for (const cat of pm.by_category) {
+    out.push(`  ${cat.label.padEnd(18)} ${String(cat.count).padStart(5)}   ${dataBar(cat.count, maxCount, 30)}`);
+  }
+  return out;
+}
+
+/**
  * Render a FullReport as a visual savings dashboard designed for screenshotting.
  *
  * Design principles:
  * - Before/After comparison bar is the HERO — one glance = "wow"
  * - "tokens saved" is the number people share
  * - Per-tool breakdown shows what each tool SAVED, sorted by impact
- * - Session memory: one line, reframed as value
+ * - Project memory: category bars showing persistent data across sessions
  * - No: Pct column, category tables, tips, jargon
- * - Under 22 lines for heavy sessions, under 10 for fresh
  */
 export function formatReport(report: FullReport, version?: string, latestVersion?: string | null): string {
   const lines: string[] = [];
@@ -442,6 +487,9 @@ export function formatReport(report: FullReport, version?: string, latestVersion
     } else {
       lines.push(`${kb(totalReturned)} entered context  |  0 tokens saved`);
     }
+
+    // Project memory
+    lines.push(...renderProjectMemory(report.projectMemory));
 
     // Footer
     lines.push("");
@@ -497,32 +545,8 @@ export function formatReport(report: FullReport, version?: string, latestVersion
     }
   }
 
-  // ── Session memory — business-friendly ──
-  if (report.continuity.total_events > 0) {
-    lines.push("");
-    const cats = report.continuity.by_category;
-    // Pick the top 3-4 most impactful categories for a human-readable summary
-    const highlights: string[] = [];
-    const fileCount = cats.find(c => c.category === "file")?.count;
-    const gitCount = cats.find(c => c.category === "git")?.count;
-    const promptCount = cats.find(c => c.category === "prompt")?.count;
-    const errorCount = cats.find(c => c.category === "error")?.count;
-    const taskCount = cats.find(c => c.category === "task")?.count;
-    if (fileCount) highlights.push(`${fileCount} files`);
-    if (gitCount) highlights.push(`${gitCount} git ops`);
-    if (promptCount) highlights.push(`${promptCount} prompts`);
-    if (errorCount) highlights.push(`${errorCount} errors`);
-    if (taskCount) highlights.push(`${taskCount} tasks`);
-
-    const summary = highlights.length > 0 ? `  ·  ${highlights.join(", ")}` : "";
-
-    if (report.continuity.compact_count > 0) {
-      lines.push(`${fmtNum(report.continuity.total_events)} events remembered across ${report.continuity.compact_count} compaction${report.continuity.compact_count !== 1 ? "s" : ""}${summary}`);
-      lines.push("Zero knowledge lost — picks up exactly where you left off.");
-    } else {
-      lines.push(`${fmtNum(report.continuity.total_events)} events tracked${summary}`);
-    }
-  }
+  // ── Project memory — persistent across sessions ──
+  lines.push(...renderProjectMemory(report.projectMemory));
 
   // ── Footer ──
   lines.push("");

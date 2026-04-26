@@ -43,6 +43,11 @@ function makeReport(overrides: Partial<FullReport> = {}): FullReport {
       compact_count: 0,
       resume_ready: false,
     },
+    projectMemory: {
+      total_events: 0,
+      session_count: 0,
+      by_category: [],
+    },
     ...overrides,
   };
 }
@@ -270,8 +275,8 @@ describe("formatReport", () => {
     });
   });
 
-  describe("session memory", () => {
-    it("shows session memory as single line with event count", () => {
+  describe("project memory", () => {
+    it("shows project memory with category bars when data exists", () => {
       const report = makeReport({
         savings: {
           ...makeReport().savings,
@@ -279,22 +284,51 @@ describe("formatReport", () => {
           total_bytes_returned: 2000,
           kept_out: 100000,
         },
-        continuity: {
-          total_events: 25,
+        projectMemory: {
+          total_events: 1656,
+          session_count: 6,
           by_category: [
-            { category: "file", count: 12, label: "Files tracked", preview: "server.ts, db.ts, utils.ts", why: "Restored after compact" },
-            { category: "git", count: 5, label: "Git operations", preview: "feat: add analytics", why: "Branch state preserved" },
+            { category: "file", count: 752, label: "Files tracked" },
+            { category: "prompt", count: 250, label: "Prompts saved" },
+            { category: "subagent", count: 202, label: "Delegated work" },
+            { category: "git", count: 155, label: "Git operations" },
+            { category: "rule", count: 152, label: "Project rules" },
+            { category: "error", count: 61, label: "Errors caught" },
+            { category: "decision", count: 27, label: "Your decisions" },
           ],
-          compact_count: 0,
-          resume_ready: true,
         },
       });
       const output = formatReport(report, "1.0.71");
 
-      expect(output).toContain("25 events tracked");
+      expect(output).toContain("1.7K events remembered across 6 sessions");
+      expect(output).toContain("searchable after compact & restart");
+      expect(output).toContain("Files tracked");
+      expect(output).toContain("Prompts saved");
+      expect(output).toContain("Git operations");
+      // Bars should contain unicode block characters
+      expect(output).toMatch(/[█░]/);
     });
 
-    it("shows compaction survival in same section when compactions > 0", () => {
+    it("shows project memory bars on fresh session too", () => {
+      const report = makeReport({
+        projectMemory: {
+          total_events: 100,
+          session_count: 2,
+          by_category: [
+            { category: "file", count: 50, label: "Files tracked" },
+            { category: "git", count: 30, label: "Git operations" },
+          ],
+        },
+      });
+      const output = formatReport(report, "1.0.71");
+
+      expect(output).toContain("100 events remembered across 2 sessions");
+      expect(output).toContain("Files tracked");
+      expect(output).toContain("Git operations");
+      expect(output).toMatch(/█/);
+    });
+
+    it("categories sorted by count DESC — highest first", () => {
       const report = makeReport({
         savings: {
           ...makeReport().savings,
@@ -302,22 +336,26 @@ describe("formatReport", () => {
           total_bytes_returned: 1000,
           kept_out: 50000,
         },
-        continuity: {
-          total_events: 47,
+        projectMemory: {
+          total_events: 100,
+          session_count: 3,
           by_category: [
-            { category: "file", count: 30, label: "Files tracked", preview: "a.ts", why: "Restored" },
+            { category: "file", count: 60, label: "Files tracked" },
+            { category: "git", count: 25, label: "Git operations" },
+            { category: "error", count: 15, label: "Errors caught" },
           ],
-          compact_count: 3,
-          resume_ready: true,
         },
       });
       const output = formatReport(report, "1.0.71");
-
-      expect(output).toContain("across 3 compactions");
-      expect(output).toContain("47 events remembered");
+      const lines = output.split("\n");
+      const fileLine = lines.findIndex((l: string) => l.includes("Files tracked"));
+      const gitLine = lines.findIndex((l: string) => l.includes("Git operations"));
+      const errorLine = lines.findIndex((l: string) => l.includes("Errors caught"));
+      expect(fileLine).toBeLessThan(gitLine);
+      expect(gitLine).toBeLessThan(errorLine);
     });
 
-    it("hides session memory when no events", () => {
+    it("hides project memory when no events", () => {
       const report = makeReport({
         savings: {
           ...makeReport().savings,
@@ -325,16 +363,31 @@ describe("formatReport", () => {
           total_bytes_returned: 1000,
           kept_out: 50000,
         },
-        continuity: {
+        projectMemory: {
           total_events: 0,
+          session_count: 0,
           by_category: [],
-          compact_count: 0,
-          resume_ready: false,
         },
       });
       const output = formatReport(report);
 
-      expect(output).not.toContain("events tracked");
+      expect(output).not.toContain("events remembered");
+    });
+
+    it("singular session label for 1 session", () => {
+      const report = makeReport({
+        projectMemory: {
+          total_events: 25,
+          session_count: 1,
+          by_category: [
+            { category: "file", count: 25, label: "Files tracked" },
+          ],
+        },
+      });
+      const output = formatReport(report);
+
+      expect(output).toContain("across 1 session \u2014");
+      expect(output).not.toContain("sessions");
     });
   });
 
@@ -353,7 +406,7 @@ describe("formatReport", () => {
       expect(output).not.toContain("```json");
     });
 
-    it("active session with tools + continuity is under 22 lines", () => {
+    it("active session with tools + project memory is under 32 lines", () => {
       const report = makeReport({
         savings: {
           ...makeReport().savings,
@@ -367,26 +420,25 @@ describe("formatReport", () => {
             { tool: "ctx_fetch_and_index", calls: 1, context_kb: 50, tokens: 12_800 },
           ],
         },
-        continuity: {
+        projectMemory: {
           total_events: 1109,
+          session_count: 4,
           by_category: [
-            { category: "file", count: 554, label: "Files tracked", preview: "server.ts", why: "Restored" },
-            { category: "subagent", count: 174, label: "Delegated work", preview: "research", why: "Preserved" },
-            { category: "prompt", count: 122, label: "Requests saved", preview: "fix bug", why: "Continues" },
-            { category: "rule", count: 96, label: "Project rules", preview: "CLAUDE.md", why: "Survives" },
-            { category: "git", count: 89, label: "Git operations", preview: "main", why: "Preserved" },
-            { category: "error", count: 35, label: "Errors caught", preview: "TypeError", why: "Tracked" },
+            { category: "file", count: 554, label: "Files tracked" },
+            { category: "subagent", count: 174, label: "Delegated work" },
+            { category: "prompt", count: 122, label: "Requests saved" },
+            { category: "rule", count: 96, label: "Project rules" },
+            { category: "git", count: 89, label: "Git operations" },
+            { category: "error", count: 35, label: "Errors caught" },
           ],
-          compact_count: 0,
-          resume_ready: true,
         },
       });
       const output = formatReport(report, "1.0.71");
       const lineCount = output.split("\n").length;
-      expect(lineCount).toBeLessThanOrEqual(22);
+      expect(lineCount).toBeLessThanOrEqual(32);
     });
 
-    it("fresh session output is under 8 lines", () => {
+    it("fresh session output is under 8 lines without project memory", () => {
       const report = makeReport();
       const output = formatReport(report, "1.0.71");
       const lineCount = output.split("\n").length;
@@ -494,18 +546,17 @@ describe("formatReport", () => {
           id: "heavy-session",
           uptime_min: "306.0",
         },
-        continuity: {
+        projectMemory: {
           total_events: 1109,
+          session_count: 4,
           by_category: [
-            { category: "file", count: 554, label: "Files tracked", preview: "server.ts", why: "Restored" },
-            { category: "subagent", count: 174, label: "Delegated work", preview: "research", why: "Preserved" },
-            { category: "prompt", count: 122, label: "Requests saved", preview: "fix bug", why: "Continues" },
-            { category: "rule", count: 96, label: "Project rules", preview: "CLAUDE.md", why: "Survives" },
-            { category: "git", count: 89, label: "Git operations", preview: "main", why: "Preserved" },
-            { category: "error", count: 35, label: "Errors caught", preview: "TypeError", why: "Tracked" },
+            { category: "file", count: 554, label: "Files tracked" },
+            { category: "subagent", count: 174, label: "Delegated work" },
+            { category: "prompt", count: 122, label: "Requests saved" },
+            { category: "rule", count: 96, label: "Project rules" },
+            { category: "git", count: 89, label: "Git operations" },
+            { category: "error", count: 35, label: "Errors caught" },
           ],
-          compact_count: 0,
-          resume_ready: true,
         },
       });
       const output = formatReport(report, "1.0.71");
@@ -528,8 +579,9 @@ describe("formatReport", () => {
       // Cache
       expect(output).toContain("cache hits");
 
-      // Session memory
-      expect(output).toContain("1.1K events tracked");
+      // Project memory
+      expect(output).toContain("1.1K events remembered across 4 sessions");
+      expect(output).toContain("Files tracked");
 
       // Footer
       expect(output).toContain("v1.0.71");
@@ -537,8 +589,6 @@ describe("formatReport", () => {
       // No forbidden elements
       expect(output).not.toContain("Tip:");
       expect(output).not.toContain("Pct");
-      expect(output).not.toContain("file 554");
-      expect(output).not.toContain("subagent 174");
 
       // Verify line lengths are reasonable
       const allLines = output.split("\n");
@@ -572,11 +622,13 @@ describe("formatReport", () => {
           id: "heavy-session",
           uptime_min: "306.0",
         },
-        continuity: {
+        projectMemory: {
           total_events: 1109,
-          by_category: [],
-          compact_count: 0,
-          resume_ready: true,
+          session_count: 4,
+          by_category: [
+            { category: "file", count: 554, label: "Files tracked" },
+            { category: "subagent", count: 174, label: "Delegated work" },
+          ],
         },
       });
       const output = formatReport(report, "1.0.71");
@@ -604,8 +656,8 @@ describe("formatReport", () => {
       const toolLines = lines.filter((l: string) => l.match(/^\s+ctx_/));
       expect(toolLines.length).toBe(4);
 
-      // Total under 25 lines
-      expect(lines.length).toBeLessThanOrEqual(25);
+      // Total under 32 lines
+      expect(lines.length).toBeLessThanOrEqual(32);
     });
   });
 });
