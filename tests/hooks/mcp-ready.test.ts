@@ -36,7 +36,6 @@ import { join } from "node:path";
 import {
   sentinelDir,
   sentinelPathForPid,
-  sentinelPath,
   isMCPReady,
 } from "../../hooks/core/mcp-ready.mjs";
 
@@ -84,10 +83,6 @@ describe("mcp-ready: contract", () => {
     expect(sentinelPathForPid(12345)).toBe(join(sentinelDir(), `${SENTINEL_PREFIX}12345`));
   });
 
-  it("sentinelPath (deprecated) still resolves to a path keyed by process.ppid", () => {
-    expect(sentinelPath()).toBe(join(sentinelDir(), `${SENTINEL_PREFIX}${process.ppid}`));
-  });
-
   describe("sentinelDir platform branch", () => {
     let originalPlatform: NodeJS.Platform;
     beforeEach(() => { originalPlatform = process.platform; });
@@ -111,13 +106,11 @@ describe("mcp-ready: contract", () => {
     expect(isMCPReady()).toBe(true);
   });
 
-  it("isMCPReady does not throw on empty-payload sentinels", () => {
-    createSentinel("test-empty-9991", "");
-    expect(() => isMCPReady()).not.toThrow();
-  });
-
-  it("isMCPReady does not throw on non-numeric-payload sentinels", () => {
-    createSentinel("test-garbage-9992", "abc");
+  it.each([
+    ["empty payload", "test-empty-9991", ""],
+    ["non-numeric payload", "test-garbage-9992", "abc"],
+  ])("isMCPReady does not throw on %s sentinels", (_label, pid, content) => {
+    createSentinel(pid, content);
     expect(() => isMCPReady()).not.toThrow();
   });
 });
@@ -143,11 +136,13 @@ describe.skipIf(POLLUTED)("mcp-ready: stale-cleanup self-healing", () => {
 
 describe("mcp-ready: PPID-independence (regression for #347)", () => {
   it("returns true when the only live sentinel is at a child PID outside the runner's process tree", async () => {
+    // Pass the resolved sentinel directory in via env var so the child does not
+    // re-derive it — keeps mcp-ready.mjs as the single source of truth for the
+    // path shape, and avoids node-CLI argv ambiguity with `-e`.
     const childScript = `
       const { writeFileSync, unlinkSync } = require("node:fs");
-      const { tmpdir } = require("node:os");
       const { join } = require("node:path");
-      const dir = process.platform === "win32" ? tmpdir() : "/tmp";
+      const dir = process.env.MCP_SENTINEL_DIR;
       const path = join(dir, "context-mode-mcp-ready-" + process.pid);
       writeFileSync(path, String(process.pid));
       const cleanup = () => { try { unlinkSync(path); } catch {} process.exit(0); };
@@ -155,9 +150,13 @@ describe("mcp-ready: PPID-independence (regression for #347)", () => {
       process.on("SIGINT", cleanup);
       setInterval(() => {}, 1000);
     `;
-    const child = spawn(process.execPath, ["-e", childScript], { stdio: "ignore" });
+    const resolvedDir = sentinelDir();
+    const child = spawn(process.execPath, ["-e", childScript], {
+      stdio: "ignore",
+      env: { ...process.env, MCP_SENTINEL_DIR: resolvedDir },
+    });
     const childPid = child.pid!;
-    const childSentinel = join(sentinelDir(), `${SENTINEL_PREFIX}${childPid}`);
+    const childSentinel = join(resolvedDir, `${SENTINEL_PREFIX}${childPid}`);
 
     try {
       // Wait up to 2s for child to write its sentinel.
