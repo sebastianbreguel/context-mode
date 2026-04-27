@@ -1524,7 +1524,9 @@ describe("batch_execute FS read tracking", () => {
 
   test("parses __CM_FS__ from batch output and updates bytesSandboxed", () => {
     expect(serverSrc).toContain("/__CM_FS__:(\\d+)/g");
-    expect(serverSrc).toContain("sessionStats.bytesSandboxed += cmdFsBytes");
+    // Handler wires the FS-bytes callback to sessionStats; the runner strips/parses.
+    expect(serverSrc).toContain("sessionStats.bytesSandboxed += bytes");
+    expect(serverSrc).toContain("onFsBytes?.(cmdFsBytes)");
   });
 
   test("strips __CM_FS__ markers from batch command output", () => {
@@ -1533,6 +1535,220 @@ describe("batch_execute FS read tracking", () => {
 
   test("cleans up preload file on shutdown", () => {
     expect(serverSrc).toContain("unlinkSync(CM_FS_PRELOAD)");
+  });
+
+  test("handler accepts concurrency input field with min/max bounds", () => {
+    expect(serverSrc).toContain("concurrency: z");
+    expect(serverSrc).toMatch(/\.min\(1\)\s*\n?\s*\.max\(8\)/);
+    expect(serverSrc).toContain(".default(1)");
+  });
+
+  test("tool description documents the concurrency field", () => {
+    expect(serverSrc).toContain("concurrency: N");
+    expect(serverSrc).toContain("(1-8, default 1)");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// runBatchCommands — concurrency, ordering, timeout semantics
+// ═══════════════════════════════════════════════════════════════════════════
+
+import { runBatchCommands, type BatchCommand } from "../../src/server.js";
+
+interface MockResult { stdout: string; timedOut?: boolean; }
+
+function mkMockExecutor(
+  handler: (code: string, timeout: number) => Promise<MockResult> | MockResult,
+): { execute: (input: { language: "shell"; code: string; timeout: number }) => Promise<MockResult> } {
+  return {
+    execute: async ({ code, timeout }) => Promise.resolve(handler(code, timeout)),
+  };
+}
+
+const NOOP_PREFIX = ""; // tests don't need NODE_OPTIONS prefix
+
+describe("runBatchCommands serial path (concurrency=1)", () => {
+  test("happy path: outputs in input order, no timeout cascade", async () => {
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "echo a" },
+      { label: "B", command: "echo b" },
+      { label: "C", command: "echo c" },
+    ];
+    const exec = mkMockExecutor((code) => ({ stdout: code.includes("echo a") ? "a" : code.includes("echo b") ? "b" : "c" }));
+    const { outputs, timedOut } = await runBatchCommands(cmds, { timeout: 5000, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(timedOut).toBe(false);
+    expect(outputs).toHaveLength(3);
+    expect(outputs[0]).toContain("# A");
+    expect(outputs[0]).toContain("a");
+    expect(outputs[1]).toContain("# B");
+    expect(outputs[2]).toContain("# C");
+  });
+
+  test("cascading skip: timeout in first cmd skips the rest", async () => {
+    let callCount = 0;
+    const exec = mkMockExecutor(() => {
+      callCount++;
+      return { stdout: "slow", timedOut: true };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "slow", command: "sleep 999" },
+      { label: "next", command: "echo next" },
+      { label: "after", command: "echo after" },
+    ];
+    const { outputs, timedOut } = await runBatchCommands(cmds, { timeout: 100, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(callCount).toBe(1); // only slow command executed
+    expect(timedOut).toBe(true);
+    expect(outputs[0]).toContain("# slow");
+    expect(outputs[1]).toContain("(skipped — batch timeout exceeded)");
+    expect(outputs[2]).toContain("(skipped — batch timeout exceeded)");
+  });
+
+  test("shared timeout budget: subsequent commands skip when budget exhausted", async () => {
+    let callCount = 0;
+    const exec = mkMockExecutor(async () => {
+      callCount++;
+      await new Promise((r) => setTimeout(r, 60)); // each call burns 60ms
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "x" },
+      { label: "B", command: "x" },
+      { label: "C", command: "x" }, // by here, elapsed > 100ms
+    ];
+    const { outputs, timedOut } = await runBatchCommands(cmds, { timeout: 100, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(callCount).toBeLessThan(3);
+    expect(timedOut).toBe(true);
+    expect(outputs.some((o) => o.includes("(skipped — batch timeout exceeded)"))).toBe(true);
+  });
+});
+
+describe("runBatchCommands parallel path (concurrency>1)", () => {
+  test("happy path: 3 cmds at concurrency=3 finish in parallel", async () => {
+    const exec = mkMockExecutor(async () => {
+      await new Promise((r) => setTimeout(r, 100));
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "x" },
+      { label: "B", command: "y" },
+      { label: "C", command: "z" },
+    ];
+    const start = Date.now();
+    const { outputs, timedOut } = await runBatchCommands(cmds, { timeout: 5000, concurrency: 3, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    const elapsed = Date.now() - start;
+    expect(timedOut).toBe(false);
+    expect(outputs).toHaveLength(3);
+    expect(elapsed).toBeLessThan(250); // 3x parallel ~100ms, with overhead room
+  });
+
+  test("order preservation: outputs match input order, not completion order", async () => {
+    const exec = mkMockExecutor(async (code) => {
+      // Reverse-order delay: first cmd is slowest
+      const delay = code.includes("first") ? 80 : code.includes("second") ? 40 : 10;
+      await new Promise((r) => setTimeout(r, delay));
+      return { stdout: code.replace("echo ", "") };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "FIRST", command: "echo first" },
+      { label: "SECOND", command: "echo second" },
+      { label: "THIRD", command: "echo third" },
+    ];
+    const { outputs } = await runBatchCommands(cmds, { timeout: 5000, concurrency: 3, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(outputs[0]).toContain("# FIRST");
+    expect(outputs[1]).toContain("# SECOND");
+    expect(outputs[2]).toContain("# THIRD");
+  });
+
+  test("concurrency cap: 6 cmds at concurrency=2 run in 3 batches", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const exec = mkMockExecutor(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 30));
+      inFlight--;
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = Array.from({ length: 6 }, (_, i) => ({ label: `C${i}`, command: "x" }));
+    await runBatchCommands(cmds, { timeout: 5000, concurrency: 2, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+    expect(maxInFlight).toBeGreaterThanOrEqual(2);
+  });
+
+  test("per-command timeout: one cmd times out, siblings continue", async () => {
+    const exec = mkMockExecutor((code) => {
+      if (code.includes("slow")) return { stdout: "", timedOut: true };
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [
+      { label: "slow", command: "sleep slow" },
+      { label: "fast", command: "echo fast" },
+    ];
+    const { outputs, timedOut } = await runBatchCommands(cmds, { timeout: 100, concurrency: 2, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(timedOut).toBe(true);
+    expect(outputs[0]).toContain("(timed out after 100ms)");
+    expect(outputs[1]).toContain("ok");
+  });
+
+  test("concurrency exceeds cmd count: caps at cmd count, no spurious workers", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const exec = mkMockExecutor(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 20));
+      inFlight--;
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [{ label: "A", command: "x" }, { label: "B", command: "y" }];
+    await runBatchCommands(cmds, { timeout: 5000, concurrency: 8, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(maxInFlight).toBeLessThanOrEqual(2);
+  });
+
+  test("FS bytes callback fires per-command in parallel branch", async () => {
+    const exec = mkMockExecutor((code) => ({
+      stdout: code.includes("a") ? "out a\n__CM_FS__:100\n" : "out b\n__CM_FS__:200\n",
+    }));
+    const cmds: BatchCommand[] = [
+      { label: "A", command: "echo a" },
+      { label: "B", command: "echo b" },
+    ];
+    let totalBytes = 0;
+    const { outputs } = await runBatchCommands(
+      cmds,
+      { timeout: 5000, concurrency: 2, nodeOptsPrefix: NOOP_PREFIX, onFsBytes: (b) => { totalBytes += b; } },
+      exec,
+    );
+    expect(totalBytes).toBe(300);
+    // markers stripped from output
+    expect(outputs.join("")).not.toContain("__CM_FS__");
+  });
+});
+
+describe("runBatchCommands edge cases", () => {
+  test("empty commands array returns empty outputs", async () => {
+    const exec = mkMockExecutor(() => ({ stdout: "" }));
+    const { outputs, timedOut } = await runBatchCommands([], { timeout: 1000, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(outputs).toHaveLength(0);
+    expect(timedOut).toBe(false);
+  });
+
+  test("empty stdout becomes (no output) sentinel", async () => {
+    const exec = mkMockExecutor(() => ({ stdout: "" }));
+    const cmds: BatchCommand[] = [{ label: "A", command: "x" }];
+    const { outputs } = await runBatchCommands(cmds, { timeout: 1000, concurrency: 1, nodeOptsPrefix: NOOP_PREFIX }, exec);
+    expect(outputs[0]).toContain("(no output)");
+  });
+
+  test("nodeOptsPrefix is prepended to each command", async () => {
+    const seen: string[] = [];
+    const exec = mkMockExecutor((code) => {
+      seen.push(code);
+      return { stdout: "ok" };
+    });
+    const cmds: BatchCommand[] = [{ label: "A", command: "echo hi" }];
+    await runBatchCommands(cmds, { timeout: 1000, concurrency: 1, nodeOptsPrefix: 'NODE_OPTIONS="--require /tmp/x" ' }, exec);
+    expect(seen[0]).toBe('NODE_OPTIONS="--require /tmp/x" echo hi 2>&1');
   });
 });
 

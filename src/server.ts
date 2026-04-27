@@ -609,6 +609,116 @@ export function formatBatchQueryResults(
 }
 
 // ─────────────────────────────────────────────────────────
+// batch_execute runner — used by ctx_batch_execute handler
+// ─────────────────────────────────────────────────────────
+
+export interface BatchCommand { label: string; command: string; }
+
+export interface BatchRunResult {
+  outputs: string[];
+  timedOut: boolean;
+}
+
+export interface BatchRunOptions {
+  timeout: number;
+  concurrency: number;
+  nodeOptsPrefix: string;
+  onFsBytes?: (bytes: number) => void;
+}
+
+interface BatchExecutor {
+  execute(input: { language: "shell"; code: string; timeout: number }): Promise<{ stdout: string; timedOut?: boolean }>;
+}
+
+function formatCommandOutput(label: string, raw: string, onFsBytes?: (bytes: number) => void): string {
+  let output = raw || "(no output)";
+  const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
+  let cmdFsBytes = 0;
+  for (const m of fsMatches) cmdFsBytes += parseInt(m[1]);
+  if (cmdFsBytes > 0) {
+    onFsBytes?.(cmdFsBytes);
+    output = output.replace(/__CM_FS__:\d+\n?/g, "");
+  }
+  return `# ${label}\n\n${output}\n`;
+}
+
+/**
+ * Execute batch commands. concurrency=1 preserves the legacy serial path
+ * (shared timeout budget + cascading skip-on-timeout). concurrency>1 runs
+ * commands concurrently with at most N in flight; each command receives the
+ * full timeout, output is collated by input index, and per-command timeouts
+ * record `(timed out)` blocks without skipping siblings.
+ */
+export async function runBatchCommands(
+  commands: BatchCommand[],
+  opts: BatchRunOptions,
+  executor: BatchExecutor,
+): Promise<BatchRunResult> {
+  const { timeout, concurrency, nodeOptsPrefix, onFsBytes } = opts;
+
+  if (concurrency <= 1) {
+    // Serial path — shared timeout budget, cascading skip on timeout.
+    const outputs: string[] = [];
+    const startTime = Date.now();
+    let timedOut = false;
+    for (let i = 0; i < commands.length; i++) {
+      const cmd = commands[i];
+      const elapsed = Date.now() - startTime;
+      const remaining = timeout - elapsed;
+      if (remaining <= 0) {
+        outputs.push(`# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`);
+        timedOut = true;
+        continue;
+      }
+      const result = await executor.execute({
+        language: "shell",
+        code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
+        timeout: remaining,
+      });
+      outputs.push(formatCommandOutput(cmd.label, result.stdout, onFsBytes));
+      if (result.timedOut) {
+        timedOut = true;
+        for (let j = i + 1; j < commands.length; j++) {
+          outputs.push(`# ${commands[j].label}\n\n(skipped — batch timeout exceeded)\n`);
+        }
+        break;
+      }
+    }
+    return { outputs, timedOut };
+  }
+
+  // Parallel path — per-command timeout, in-flight cap, order preserved by index.
+  const outputs: string[] = new Array(commands.length);
+  let timedOut = false;
+  const cap = Math.min(concurrency, commands.length);
+  let nextIdx = 0;
+
+  async function worker(): Promise<void> {
+    while (true) {
+      const idx = nextIdx++;
+      if (idx >= commands.length) return;
+      const cmd = commands[idx];
+      const result = await executor.execute({
+        language: "shell",
+        code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
+        timeout,
+      });
+      if (result.timedOut) {
+        timedOut = true;
+        outputs[idx] = `# ${cmd.label}\n\n(timed out after ${timeout}ms)\n`;
+      } else {
+        outputs[idx] = formatCommandOutput(cmd.label, result.stdout, onFsBytes);
+      }
+    }
+  }
+
+  const workers: Promise<void>[] = [];
+  for (let w = 0; w < cap; w++) workers.push(worker());
+  await Promise.all(workers);
+  return { outputs, timedOut };
+}
+
+// ─────────────────────────────────────────────────────────
 // Tool: execute
 // ─────────────────────────────────────────────────────────
 
@@ -1630,6 +1740,10 @@ server.registerTool(
       "THIS IS THE PRIMARY TOOL. Use this instead of multiple execute() calls.\n\n" +
       "One batch_execute call replaces 30+ execute calls + 10+ search calls.\n" +
       "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
+      "Pass `concurrency: N` (1-8, default 1) to run commands in parallel. " +
+      "When concurrency>1, each command receives the full `timeout` (no shared budget) and " +
+      "individual timeouts record `(timed out)` blocks without skipping siblings. " +
+      "Output order always matches input order.\n\n" +
       "THINK IN CODE: When commands produce data you need to analyze, add processing commands that filter and summarize. Don't pull raw output into context — let the sandbox do the work.\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
@@ -1663,9 +1777,21 @@ server.registerTool(
         .optional()
         .default(60000)
         .describe("Max execution time in ms (default: 60s)"),
+      concurrency: z
+        .coerce.number()
+        .int()
+        .min(1)
+        .max(8)
+        .optional()
+        .default(1)
+        .describe(
+          "Max commands to run in parallel (1-8, default: 1). " +
+          ">1 switches to per-command timeouts (no shared budget) and " +
+          "individual `(timed out)` blocks instead of cascading skip.",
+        ),
     }),
   },
-  async ({ commands, queries, timeout }) => {
+  async ({ commands, queries, timeout, concurrency }) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
       const denied = checkDenyPolicy(cmd.command, "batch_execute");
@@ -1673,61 +1799,21 @@ server.registerTool(
     }
 
     try {
-      // Execute each command individually so every command gets its own
-      // output capture. Full stdout is preserved and indexed into FTS5.
-      // (Issue #61, #197)
-      const perCommandOutputs: string[] = [];
-      const startTime = Date.now();
-      let timedOut = false;
-
       // Inject NODE_OPTIONS for FS read tracking in spawned Node processes.
       // The executor denies NODE_OPTIONS in its env (security), so we set it
       // as an inline shell prefix. This only affects child `node` invocations.
       const nodeOptsPrefix = `NODE_OPTIONS="--require ${CM_FS_PRELOAD}" `;
 
-      for (const cmd of commands) {
-        const elapsed = Date.now() - startTime;
-        const remaining = timeout - elapsed;
-        if (remaining <= 0) {
-          perCommandOutputs.push(
-            `# ${cmd.label}\n\n(skipped — batch timeout exceeded)\n`,
-          );
-          timedOut = true;
-          continue;
-        }
-
-        const result = await executor.execute({
-          language: "shell",
-          code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
-          timeout: remaining,
-        });
-
-        let output = result.stdout || "(no output)";
-
-        // Parse and strip __CM_FS__ markers emitted by the preload script.
-        // Because 2>&1 merges stderr into stdout, markers appear in output.
-        const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
-        let cmdFsBytes = 0;
-        for (const m of fsMatches) cmdFsBytes += parseInt(m[1]);
-        if (cmdFsBytes > 0) {
-          sessionStats.bytesSandboxed += cmdFsBytes;
-          output = output.replace(/__CM_FS__:\d+\n?/g, "");
-        }
-
-        perCommandOutputs.push(`# ${cmd.label}\n\n${output}\n`);
-
-        if (result.timedOut) {
-          timedOut = true;
-          // Mark remaining commands as skipped
-          const idx = commands.indexOf(cmd);
-          for (let i = idx + 1; i < commands.length; i++) {
-            perCommandOutputs.push(
-              `# ${commands[i].label}\n\n(skipped — batch timeout exceeded)\n`,
-            );
-          }
-          break;
-        }
-      }
+      const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
+        commands,
+        {
+          timeout,
+          concurrency,
+          nodeOptsPrefix,
+          onFsBytes: (bytes) => { sessionStats.bytesSandboxed += bytes; },
+        },
+        executor,
+      );
 
       const stdout = perCommandOutputs.join("\n");
       const totalBytes = Buffer.byteLength(stdout);
