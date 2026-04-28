@@ -29,7 +29,7 @@ import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix, SessionDB } from "./session/db.js";
 import { searchAllSources } from "./search/unified.js";
-import type { HookAdapter } from "./adapters/types.js";
+import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
@@ -2040,9 +2040,9 @@ server.registerTool(
     let cmd: string;
 
     if (existsSync(bundlePath)) {
-      cmd = `node "${bundlePath}" upgrade`;
+      cmd = `${buildNodeCommand(bundlePath)} upgrade`;
     } else if (existsSync(fallbackPath)) {
-      cmd = `node "${fallbackPath}" upgrade`;
+      cmd = `${buildNodeCommand(fallbackPath)} upgrade`;
     } else {
       // Inline fallback: neither CLI file exists (e.g. marketplace installs).
       // Generate a self-contained node -e script that performs the upgrade.
@@ -2090,7 +2090,7 @@ server.registerTool(
       const tmpScript = resolve(pluginRoot, ".ctx-upgrade-inline.mjs");
       const { writeFileSync: writeTmp } = await import("node:fs");
       writeTmp(tmpScript, scriptLines);
-      cmd = `node "${tmpScript}"`;
+      cmd = buildNodeCommand(tmpScript);
     }
 
     const text = [
