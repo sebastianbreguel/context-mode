@@ -224,6 +224,10 @@ export class GeminiCLIAdapter extends BaseAdapter implements HookAdapter {
     return resolve(homedir(), ".gemini", "settings.json");
   }
 
+  getInstructionFiles(): string[] {
+    return ["GEMINI.md"];
+  }
+
   generateHookConfig(pluginRoot: string): HookRegistration {
     return {
       [GEMINI_HOOK_NAMES.BEFORE_TOOL]: [

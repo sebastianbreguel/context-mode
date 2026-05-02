@@ -18,7 +18,7 @@ import { join, dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import { describe, test, expect, afterAll } from "vitest";
+import { describe, test, expect, beforeAll, afterAll } from "vitest";
 
 import { classifyNonZeroExit } from "../../src/exit-classify.js";
 import { PolyglotExecutor } from "../../src/executor.js";
@@ -747,6 +747,165 @@ print(f"count: {data['count']}")
     assert.equal(r.exitCode, 0, `Expected exit 0: ${r.stderr}`);
     assert.ok(r.stdout.includes("hello from project dir"));
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ctx_index: projectRoot path resolution (#365)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Mirrors the executeFile relative-path resolution tests (line ~598). Confirms
+// that ctx_index resolves a relative `path` argument against the detected
+// project directory (CLAUDE_PROJECT_DIR / *_PROJECT_DIR / CONTEXT_MODE_PROJECT_DIR
+// → cwd fallback) instead of the MCP server process cwd. End-to-end via
+// JSON-RPC against a freshly spawned server with an injected project dir.
+
+describe("ctx_index: projectRoot path resolution (#365)", () => {
+  const ctxProjectDir = mkdtempSync(join(tmpdir(), "ctx-index-projroot-"));
+  const ctxFileName = "ctx-index-projroot-target.md";
+  const uniqueMarker = `ctx-index-marker-${process.pid}-${Date.now()}`;
+
+  beforeAll(() => {
+    writeFileSync(
+      join(ctxProjectDir, ctxFileName),
+      `# ctx_index relative path test\n\nUnique marker: ${uniqueMarker}\n`,
+      "utf-8",
+    );
+  });
+
+  afterAll(() => {
+    rmSync(ctxProjectDir, { recursive: true, force: true });
+  });
+
+  function spawnServerWithProjectDir(projectDirEnv: string): ChildProcess {
+    return spawn("node", [mcpEntry], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        CLAUDE_PROJECT_DIR: projectDirEnv,
+      },
+    });
+  }
+
+  // MCP server processes JSON-RPC requests concurrently — we have to wait for
+  // each response before sending the next one in tests that depend on order
+  // (e.g. index then search). The shared `collectRpcResponses` helper kills
+  // the proc once all expected ids arrive, so we use it serially per-call.
+  async function awaitRpc(
+    proc: ChildProcess,
+    id: number,
+    request: Record<string, unknown>,
+    timeoutMs = 15_000,
+  ): Promise<DoctorJsonRpcResponse | undefined> {
+    return new Promise((resolve) => {
+      let buffer = "";
+      const onData = (d: Buffer) => {
+        buffer += d.toString();
+        let idx: number;
+        while ((idx = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line) as DoctorJsonRpcResponse;
+            if (parsed.id === id) {
+              proc.stdout!.off("data", onData);
+              clearTimeout(timer);
+              resolve(parsed);
+              return;
+            }
+          } catch { /* ignore */ }
+        }
+      };
+      const timer = setTimeout(() => {
+        proc.stdout!.off("data", onData);
+        resolve(undefined);
+      }, timeoutMs);
+      proc.stdout!.on("data", onData);
+      sendRpc(proc, request);
+    });
+  }
+
+  test("relative path resolves against CLAUDE_PROJECT_DIR, not server cwd", async () => {
+    const proc = spawnServerWithProjectDir(ctxProjectDir);
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-pr365", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "ctx_index", arguments: { path: ctxFileName } },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      expect(indexText).toMatch(/Indexed \d+ section/);
+
+      // Only send search AFTER index has completed — MCP server processes
+      // requests concurrently, so a piggybacked search would race the index.
+      const searchResp = await awaitRpc(proc, 101, {
+        jsonrpc: "2.0", id: 101, method: "tools/call",
+        params: { name: "ctx_search", arguments: { queries: [uniqueMarker] } },
+      });
+
+      expect(searchResp?.error).toBeUndefined();
+      const searchText = searchResp?.result?.content?.[0]?.text ?? "";
+      expect(searchText).toContain(uniqueMarker);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+
+  test("absolute path bypasses project-dir resolution", async () => {
+    const absFile = join(ctxProjectDir, ctxFileName);
+    const proc = spawnServerWithProjectDir("/non-existent-dir-on-purpose");
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-pr365-abs", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "ctx_index", arguments: { path: absFile } },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      expect(indexText).toMatch(/Indexed \d+ section/);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+
+  test("relative path label preserves user input (not resolved absolute)", async () => {
+    const proc = spawnServerWithProjectDir(ctxProjectDir);
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-pr365-label", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "ctx_index", arguments: { path: ctxFileName } },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      // Label must reflect the relative path the user typed, not the resolved absolute path.
+      // Keeps `ctx_search(source: "<relative-path>")` working as the user expects.
+      expect(indexText).toContain(`from: ${ctxFileName}`);
+      expect(indexText).not.toContain(ctxProjectDir);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1654,4 +1813,73 @@ describe("ctx_doctor — resource cleanup regression (#247)", () => {
       expect(c!.result?.content?.[0]?.text).toContain("context-mode doctor");
     }
   }, 35_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Pre-detection session dir (race-condition fix)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Before the MCP `initialize` handshake completes, `_detectedAdapter` is null.
+// Tools called in that window must still resolve a platform-correct sessions
+// dir instead of falling back to hardcoded `~/.claude/context-mode/sessions/`.
+//
+// `getSessionDirSegments` is a sync, env-free map from PlatformId → segments
+// (no adapter instantiation). `getSessionDir` calls `detectPlatform()` (sync,
+// env-var-based) and feeds the result into the map. Falls back to `.claude`
+// only if the map returns null (defensive — covers "unknown" PlatformId).
+
+describe("getSessionDirSegments — sync platform → segments map", () => {
+  test("returns correct segments for every supported platform", async () => {
+    const { getSessionDirSegments } = await import("../../src/adapters/detect.js");
+    expect(getSessionDirSegments("claude-code")).toEqual([".claude"]);
+    expect(getSessionDirSegments("codex")).toEqual([".codex"]);
+    expect(getSessionDirSegments("qwen-code")).toEqual([".qwen"]);
+    expect(getSessionDirSegments("gemini-cli")).toEqual([".gemini"]);
+    expect(getSessionDirSegments("kiro")).toEqual([".kiro"]);
+    expect(getSessionDirSegments("cursor")).toEqual([".cursor"]);
+    expect(getSessionDirSegments("openclaw")).toEqual([".openclaw"]);
+    expect(getSessionDirSegments("vscode-copilot")).toEqual([".vscode"]);
+    expect(getSessionDirSegments("antigravity")).toEqual([".gemini"]);
+    expect(getSessionDirSegments("pi")).toEqual([".pi"]);
+    expect(getSessionDirSegments("kilo")).toEqual([".config", "kilo"]);
+    expect(getSessionDirSegments("opencode")).toEqual([".config", "opencode"]);
+    expect(getSessionDirSegments("zed")).toEqual([".config", "zed"]);
+    expect(getSessionDirSegments("jetbrains-copilot")).toEqual([".config", "JetBrains"]);
+  });
+
+  test("returns null for unknown platform", async () => {
+    const { getSessionDirSegments } = await import("../../src/adapters/detect.js");
+    expect(getSessionDirSegments("unknown")).toBeNull();
+    expect(getSessionDirSegments("not-a-platform")).toBeNull();
+  });
+});
+
+describe("getSessionDir uses pre-detection when adapter not yet detected", () => {
+  const serverSrc = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+
+  test("getSessionDir invokes detectPlatform + getSessionDirSegments before fallback", () => {
+    const fn = serverSrc.match(/function getSessionDir\(\)[\s\S]*?^}/m);
+    expect(fn, "getSessionDir not found in server.ts").not.toBeNull();
+    const body = fn![0];
+    // Pre-detection path must consult detectPlatform() and the sync segments map
+    expect(body).toContain("detectPlatform");
+    expect(body).toContain("getSessionDirSegments");
+  });
+
+  test("getSessionDir falls back to .claude only as last resort", () => {
+    const fn = serverSrc.match(/function getSessionDir\(\)[\s\S]*?^}/m);
+    expect(fn).not.toBeNull();
+    const body = fn![0];
+    // The .claude literal must still appear (last-resort fallback) but only
+    // after both pre-detection branches. Verify the ordering: detectPlatform
+    // call comes before the literal.
+    const detectIdx = body.indexOf("detectPlatform");
+    const claudeIdx = body.indexOf('".claude"');
+    expect(detectIdx).toBeGreaterThan(-1);
+    expect(claudeIdx).toBeGreaterThan(-1);
+    expect(detectIdx).toBeLessThan(claudeIdx);
+  });
 });

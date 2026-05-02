@@ -17,11 +17,12 @@ import "./ensure-deps.mjs";
 
 import { createRoutingBlock } from "./routing-block.mjs";
 import { createToolNamer } from "./core/tool-naming.mjs";
+import { buildAutoInjection } from "./auto-injection.mjs";
 
 const toolNamer = createToolNamer("claude-code");
 const ROUTING_BLOCK = createRoutingBlock(toolNamer);
 import { readStdin, parseStdin, getSessionId, getSessionDBPath, getSessionEventsPath, getCleanupFlagPath, resolveConfigDir } from "./session-helpers.mjs";
-import { writeSessionEventsFile, buildSessionDirective, getSessionEvents, getLatestSessionEvents } from "./session-directive.mjs";
+import { writeSessionEventsFile, buildSessionDirective, getSessionEvents } from "./session-directive.mjs";
 import { createSessionLoaders } from "./session-loaders.mjs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -54,6 +55,22 @@ try {
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath());
       additionalContext += buildSessionDirective("compact", eventMeta, toolNamer);
+
+      // Auto-inject behavioral state on compaction (role, decisions, skills, intent)
+      const autoInjection = buildAutoInjection(events);
+      if (autoInjection) {
+        additionalContext += "\n\n" + autoInjection;
+      }
+
+      // Write session-resume event
+      try {
+        db.insertEvent(sessionId, {
+          type: "resume_completed",
+          category: "session-resume",
+          data: `Session resumed from ${source}. Prior events loaded.`,
+          priority: 1,
+        }, "SessionStart");
+      } catch { /* best-effort */ }
     }
 
     db.close();
@@ -65,7 +82,13 @@ try {
     const dbPath = getSessionDBPath();
     const db = new SessionDB({ dbPath });
 
-    const events = getLatestSessionEvents(db);
+    // Filter events to the session being resumed. Falling back to
+    // getLatestSessionEvents(db) leaks events from any other session whose
+    // session_meta.started_at is more recent — observed cross-session bleed
+    // when a different worktree session started after this one and before
+    // the resume.
+    const sessionId = getSessionId(input);
+    const events = sessionId ? getSessionEvents(db, sessionId) : [];
     if (events.length > 0) {
       const eventMeta = writeSessionEventsFile(events, getSessionEventsPath());
       additionalContext += buildSessionDirective("resume", eventMeta, toolNamer);

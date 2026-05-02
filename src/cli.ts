@@ -65,6 +65,8 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     pretooluse: "hooks/codex/pretooluse.mjs",
     posttooluse: "hooks/codex/posttooluse.mjs",
     sessionstart: "hooks/codex/sessionstart.mjs",
+    userpromptsubmit: "hooks/codex/userpromptsubmit.mjs",
+    stop: "hooks/codex/stop.mjs",
   },
   "kiro": {
     pretooluse: "hooks/kiro/pretooluse.mjs",
@@ -167,14 +169,18 @@ function defaultPluginRoot(): string {
   return __dirname;
 }
 
-// Opencode/Kilocode install plugins from npm into .cache folder
+// Opencode/Kilocode install plugins from npm into a per-package cache folder.
+// Layout (changed silently in late 2024 — see PR #376 / KiloCode#9503):
+//   POSIX  : ~/.cache/<platform>/packages/context-mode@latest/node_modules/context-mode
+//   Windows: %LOCALAPPDATA%\<platform>\packages\context-mode@latest\node_modules\context-mode
 function cachePluginRoot(platform: string): string {
+  const subPath = ["packages", "context-mode@latest", "node_modules", "context-mode"];
   if (process.platform === "win32") {
     const localApp = process.env.LOCALAPPDATA;
-    if (localApp) return resolve(localApp, platform, "node_modules", "context-mode");
-    return resolve(homedir(), "AppData", "Local", platform, "node_modules", "context-mode");
+    if (localApp) return resolve(localApp, platform, ...subPath);
+    return resolve(homedir(), "AppData", "Local", platform, ...subPath);
   }
-  return resolve(homedir(), ".cache", platform, "node_modules", "context-mode");
+  return resolve(homedir(), ".cache", platform, ...subPath);
 }
 
 function getPluginRoot(): string {

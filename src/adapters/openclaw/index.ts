@@ -205,6 +205,23 @@ export class OpenClawAdapter extends BaseAdapter implements HookAdapter {
     return resolve("openclaw.json");
   }
 
+  /**
+   * OpenClaw stores everything in the project root — no separate
+   * config dir. Returned as empty so callers fall through to projectDir.
+   */
+  getConfigDir(): string {
+    return "";
+  }
+
+  getInstructionFiles(): string[] {
+    return ["AGENTS.md"];
+  }
+
+  /** Project-relative ./memory directory. */
+  getMemoryDir(): string {
+    return "memory";
+  }
+
   generateHookConfig(_pluginRoot: string): HookRegistration {
     // OpenClaw uses TS plugin paradigm — hooks are registered via
     // api.registerHook() in the plugin entry point, not via config files.

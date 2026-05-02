@@ -218,6 +218,31 @@ export interface HookAdapter {
   /** Compute per-project session events file path. */
   getSessionEventsPath(projectDir: string): string;
 
+  /**
+   * Platform config directory (e.g., ~/.claude, ~/.codex, ~/.qwen,
+   * ~/.config/opencode). For project-scoped platforms (cursor,
+   * vscode-copilot, jetbrains-copilot, openclaw), returns the in-project
+   * convention dir name (e.g., ".cursor", ".github") — callers resolve
+   * against projectDir as needed. Used for auto-memory + ctx_search timeline.
+   */
+  getConfigDir(): string;
+
+  /**
+   * Names of platform-native instruction/rule files that act as the
+   * project's "user CLAUDE.md equivalent" (e.g., ["CLAUDE.md"],
+   * ["AGENTS.md"], ["GEMINI.md"]). Auto-memory scans for these in the
+   * project root and config dir, and rule-detection emits "rule" events
+   * when they are read.
+   */
+  getInstructionFiles(): string[];
+
+  /**
+   * Directory where persistent per-user memory is stored
+   * (e.g., ~/.claude/memory, ~/.codex/memories). Auto-memory scans
+   * *.md files in this directory.
+   */
+  getMemoryDir(): string;
+
   /** Generate hook registration config for this platform. */
   generateHookConfig(pluginRoot: string): HookRegistration;
 
@@ -273,6 +298,28 @@ export interface DiagnosticResult {
 // ─────────────────────────────────────────────────────────
 // Platform detection
 // ─────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────
+// Cross-platform command helpers (#369, #372)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Build a cross-platform `node <script>` command string.
+ *
+ * Fixes two Windows bugs:
+ *   #369 — Bare `node` fails on Windows Git Bash (MSYS) because PATH
+ *          resolution is unreliable. Uses `process.execPath` instead.
+ *   #372 — MSYS rewrites absolute paths on non-C: drives (e.g.
+ *          `C:\Users\...` → `D:\c\Users\...`). Forward slashes +
+ *          double-quoting prevents the translation.
+ *
+ * Safe on macOS/Linux — quoting and forward slashes are no-ops there.
+ */
+export function buildNodeCommand(scriptPath: string): string {
+  const nodePath = process.execPath.replace(/\\/g, "/");
+  const safePath = scriptPath.replace(/\\/g, "/");
+  return `"${nodePath}" "${safePath}"`;
+}
 
 /** Supported platform identifiers. */
 export type PlatformId =

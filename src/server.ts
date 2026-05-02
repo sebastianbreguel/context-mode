@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, type ChildProcess } from "node:child_process";
-import { join, dirname, resolve, sep } from "node:path";
+import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { request as httpsRequest } from "node:https";
@@ -27,10 +27,12 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
-import { getWorktreeSuffix } from "./session/db.js";
-import type { HookAdapter } from "./adapters/types.js";
+import { getWorktreeSuffix, SessionDB } from "./session/db.js";
+import { searchAllSources } from "./search/unified.js";
+import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
+import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport, getLifetimeStats } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -72,7 +74,7 @@ const executor = new PolyglotExecutor({
 });
 
 // ─────────────────────────────────────────────────────────
-// FS read tracking preload for batch_execute
+// FS read tracking preload for ctx_batch_execute
 // ─────────────────────────────────────────────────────────
 // NODE_OPTIONS is denied by the executor's #buildSafeEnv (security).
 // Instead, we inject it as an inline shell env prefix in each batch command.
@@ -122,10 +124,28 @@ let _insightChild: ChildProcess | null = null;
 
 /**
  * Get the platform-specific sessions directory from the detected adapter.
- * Falls back to ~/.claude/context-mode/sessions/ before adapter detection.
+ *
+ * Pre-detection path (race window before MCP `initialize` completes):
+ * call `detectPlatform()` (sync, env-var-based) and look up segments via
+ * `getSessionDirSegments()` (sync map, no adapter instantiation). This keeps
+ * non-Claude platforms from spilling sessions into `~/.claude/`.
+ *
+ * Last-resort `.claude` fallback only fires if the segments map returns null
+ * (e.g., "unknown" PlatformId) or if anything throws.
  */
 function getSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
+
+  try {
+    const signal = detectPlatform();
+    const segments = getSessionDirSegments(signal.platform);
+    if (segments) {
+      const dir = join(homedir(), ...segments, "context-mode", "sessions");
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+  } catch { /* fall through to default */ }
+
   const dir = join(homedir(), ".claude", "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return dir;
@@ -150,6 +170,10 @@ function getProjectDir(): string {
     || process.env.PI_PROJECT_DIR
     || process.env.CONTEXT_MODE_PROJECT_DIR
     || process.cwd();
+}
+
+function resolveProjectPath(filePath: string): string {
+  return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
 }
 
 /**
@@ -344,7 +368,42 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   sessionStats.calls[toolName] = (sessionStats.calls[toolName] || 0) + 1;
   sessionStats.bytesReturned[toolName] =
     (sessionStats.bytesReturned[toolName] || 0) + bytes;
+
+  // Persist to SessionDB so counters survive process restart, --continue, upgrade.
+  // Best-effort: never throws, never blocks.
+  persistToolCallCounter(toolName, bytes);
+
   return response;
+}
+
+/**
+ * Increment the per-session, per-tool counter in SessionDB so ctx_stats
+ * keeps showing the right numbers after the server restarts mid-session
+ * (e.g. on `npm update -g context-mode` or `claude --continue`).
+ *
+ * The session_id used is whatever session_meta currently holds as the
+ * most recent session — populated by the SessionStart hook.
+ */
+function persistToolCallCounter(toolName: string, bytes: number): void {
+  try {
+    const dbHash = hashProjectDir();
+    const worktreeSuffix = getWorktreeSuffix();
+    const sessionDbPath = join(
+      getSessionDir(),
+      `${dbHash}${worktreeSuffix}.db`,
+    );
+    if (!existsSync(sessionDbPath)) return;
+    const sdb = new SessionDB({ dbPath: sessionDbPath });
+    try {
+      const sid = sdb.getLatestSessionId();
+      if (!sid) return;
+      sdb.incrementToolCall(sid, toolName, bytes);
+    } finally {
+      sdb.close();
+    }
+  } catch {
+    // best-effort: counter must never throw
+  }
 }
 
 function trackIndexed(bytes: number): void {
@@ -581,7 +640,7 @@ export function formatBatchQueryResults(
 
   for (const query of queries) {
     if (outputSize > maxOutput) {
-      sections.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
+      sections.push(`## ${query}\n(output cap reached — use ctx_search(queries: ["${query}"]) for details)\n`);
       continue;
     }
 
@@ -654,7 +713,7 @@ server.registerTool(
         .describe(
           "What you're looking for in the output. When provided and output is large (>5KB), " +
           "indexes output into knowledge base and returns section titles + previews — not full content. " +
-          "Use search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
+          "Use ctx_search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
           "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
         ),
     }),
@@ -869,7 +928,7 @@ function indexStdout(
     content: [
       {
         type: "text" as const,
-        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
+        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
       },
     ],
   };
@@ -891,7 +950,7 @@ function intentSearch(
   const totalLines = stdout.split("\n").length;
   const totalBytes = Buffer.byteLength(stdout);
 
-  // Index into the PERSISTENT store so user can search() later
+  // Index into the PERSISTENT store so user can ctx_search() later
   const persistent = getStore();
   const indexed = persistent.indexPlainText(stdout, source);
 
@@ -911,7 +970,7 @@ function intentSearch(
       lines.push(`Searchable terms: ${distinctiveTerms.join(", ")}`);
     }
     lines.push("");
-    lines.push("Use search() to explore the indexed content.");
+    lines.push("Use ctx_search(queries: [...]) to explore the indexed content.");
     return lines.join("\n");
   }
 
@@ -933,7 +992,7 @@ function intentSearch(
   }
 
   lines.push("");
-  lines.push("Use search(queries: [...]) to retrieve full content of any section.");
+  lines.push("Use ctx_search(queries: [...]) to retrieve full content of any section.");
 
   return lines.join("\n");
 }
@@ -1103,9 +1162,9 @@ server.registerTool(
       "- Skill prompts and instructions that are too large for context\n" +
       "- README files, migration guides, changelog entries\n" +
       "- Any content with code examples you may need to reference precisely\n\n" +
-      "After indexing, use 'search' to retrieve specific sections on-demand.\n" +
+      "After indexing, use 'ctx_search' to retrieve specific sections on-demand.\n" +
       "When `path` is provided, a content hash is stored for automatic stale detection in search results.\n" +
-      "Do NOT use for: log files, test output, CSV, build output — use 'execute_file' for those.",
+      "Do NOT use for: log files, test output, CSV, build output — use 'ctx_execute_file' for those.",
     inputSchema: z.object({
       content: z
         .string()
@@ -1141,22 +1200,24 @@ server.registerTool(
     }
 
     try {
+      const resolvedPath = path ? resolveProjectPath(path) : undefined;
+
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
-      else if (path) {
+      else if (resolvedPath) {
         try {
           const fs = await import("fs");
-          trackIndexed(fs.readFileSync(path).byteLength);
+          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path, source });
+      const result = store.index({ content, path: resolvedPath, source: source ?? path });
 
       return trackResponse("ctx_index", {
         content: [
           {
             type: "text" as const,
-            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
+            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
           },
         ],
       });
@@ -1222,6 +1283,7 @@ server.registerTool(
       "Pass ALL search questions as queries array in ONE call. " +
       "File-backed sources are auto-refreshed when the source file changes.\n\n" +
       "TIPS: 2-4 specific terms per query. Use 'source' to scope results.\n\n" +
+      "SESSION STATE: If skills, roles, or decisions were set earlier in this conversation, they are still active. Do not discard or contradict them.\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
     inputSchema: z.object({
       queries: z.preprocess(coerceJsonArray, z
@@ -1241,15 +1303,24 @@ server.registerTool(
         .enum(["code", "prose"])
         .optional()
         .describe("Filter results by content type: 'code' or 'prose'."),
+      sort: z
+        .enum(["relevance", "timeline"])
+        .optional()
+        .default("relevance")
+        .describe(
+          "Sort mode. 'relevance' (default): BM25 ranked, current session only. " +
+          "'timeline': chronological across current session, prior sessions, and auto-memory."
+        ),
     }),
   },
   async (params) => {
     try {
       const store = getStore();
+      const sort = (params as Record<string, unknown>).sort as string || "relevance";
 
       // Guard: redirect when the index is empty — ctx_search is a follow-up
-      // tool that requires prior indexing. Guide the model to the right tool.
-      if (store.getStats().chunks === 0) {
+      // tool that requires prior indexing. Skip for timeline mode (SessionDB/auto-memory may have data).
+      if (sort !== "timeline" && store.getStats().chunks === 0) {
         return trackResponse("ctx_search", {
           content: [{
             type: "text" as const,
@@ -1299,7 +1370,7 @@ server.registerTool(
             type: "text" as const,
             text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - searchWindowStart) / 1000)}s. ` +
               "You're flooding context. STOP making individual search calls. " +
-              "Use batch_execute(commands, queries) for your next research step.",
+              "Use ctx_batch_execute(commands, queries) for your next research step.",
           }],
           isError: true,
         });
@@ -1314,13 +1385,50 @@ server.registerTool(
       let totalSize = 0;
       const sections: string[] = [];
 
+      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query).
+      // The DB filename must match what session-snapshot/session-extract write to,
+      // which is `${hash}${getWorktreeSuffix()}.db` — bug #4 was the missing suffix.
+      let timelineDB: InstanceType<typeof SessionDB> | null = null;
+      if (sort === "timeline") {
+        try {
+          const sessionsDir = getSessionDir();
+          const dbFile = join(sessionsDir, `${hashProjectDir()}${getWorktreeSuffix()}.db`);
+          if (existsSync(dbFile)) {
+            timelineDB = new SessionDB({ dbPath: dbFile });
+          }
+        } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
+      }
+
+      // Adapter-aware config dir. Falls back to CLAUDE_CONFIG_DIR / ~/.claude
+      // only when no platform adapter has been detected (e.g. raw `npx context-mode dev`).
+      const configDir = _detectedAdapter?.getConfigDir()
+        || process.env.CLAUDE_CONFIG_DIR
+        || join(homedir(), ".claude");
+
+      try {
       for (const q of queryList) {
         if (totalSize > MAX_TOTAL) {
           sections.push(`## ${q}\n(output cap reached)\n`);
           continue;
         }
 
-        const results = store.searchWithFallback(q, effectiveLimit, source, contentType);
+        let results;
+        if (sort === "timeline") {
+          results = searchAllSources({
+            query: q,
+            limit: effectiveLimit,
+            store,
+            sort,
+            source,
+            contentType,
+            sessionDB: timelineDB,
+            projectDir: getProjectDir(),
+            configDir,
+            adapter: _detectedAdapter ?? undefined,
+          });
+        } else {
+          results = store.searchWithFallback(q, effectiveLimit, source, contentType);
+        }
 
         if (results.length === 0) {
           sections.push(`## ${q}\nNo results found.`);
@@ -1329,7 +1437,9 @@ server.registerTool(
 
         const formatted = results
           .map((r, i) => {
-            const header = `--- [${r.source}] ---`;
+            const origin = (r as any).origin || "current-session";
+            const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
+            const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
             const heading = `### ${r.title}`;
             const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
             return `${header}\n${heading}\n\n${snippet}`;
@@ -1338,6 +1448,9 @@ server.registerTool(
 
         sections.push(`## ${q}\n\n${formatted}`);
         totalSize += formatted.length;
+      }
+      } finally {
+        try { timelineDB?.close(); } catch {}
       }
 
       let output = sections.join("\n\n---\n\n");
@@ -1351,7 +1464,7 @@ server.registerTool(
       if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
         output += `\n\n⚠ search call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
           `Results limited to ${effectiveLimit}/query. ` +
-          `Batch queries: search(queries: ["q1","q2","q3"]) or use batch_execute.`;
+          `Batch queries: ctx_search(queries: ["q1","q2","q3"]) or use ctx_batch_execute.`;
       }
 
       if (output.trim().length === 0) {
@@ -1466,7 +1579,7 @@ server.registerTool(
     title: "Fetch & Index URL",
     description:
       "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
-      "and returns a ~3KB preview. Full content stays in sandbox — use search() for deeper lookups.\n\n" +
+      "and returns a ~3KB preview. Full content stays in sandbox — use ctx_search() for deeper lookups.\n\n" +
       "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.\n\n" +
       "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
@@ -1506,7 +1619,7 @@ server.registerTool(
           return trackResponse("ctx_fetch_and_index", {
             content: [{
               type: "text" as const,
-              text: `Cached: **${meta.label}** — ${meta.chunkCount} sections, indexed ${ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call search() to answer questions about this content — this cached response contains no content.\nUse: search(queries: [...], source: "${meta.label}")`,
+              text: `Cached: **${meta.label}** — ${meta.chunkCount} sections, indexed ${ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${meta.label}")`,
             }],
           });
         }
@@ -1585,13 +1698,13 @@ server.registerTool(
       // Build preview — first ~3KB of markdown for immediate use
       const PREVIEW_LIMIT = 3072;
       const preview = markdown.length > PREVIEW_LIMIT
-        ? markdown.slice(0, PREVIEW_LIMIT) + "\n\n…[truncated — use search() for full content]"
+        ? markdown.slice(0, PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
         : markdown;
       const totalKB = (Buffer.byteLength(markdown) / 1024).toFixed(1);
 
       const text = [
         `Fetched and indexed **${indexed.totalChunks} sections** (${totalKB}KB) from: ${indexed.label}`,
-        `Full content indexed in sandbox — use search(queries: [...], source: "${indexed.label}") for specific lookups.`,
+        `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${indexed.label}") for specific lookups.`,
         "",
         "---",
         "",
@@ -1627,8 +1740,8 @@ server.registerTool(
     description:
       "Execute multiple commands in ONE call, auto-index all output, and search with multiple queries. " +
       "Returns search results directly — no follow-up calls needed.\n\n" +
-      "THIS IS THE PRIMARY TOOL. Use this instead of multiple execute() calls.\n\n" +
-      "One batch_execute call replaces 30+ execute calls + 10+ search calls.\n" +
+      "THIS IS THE PRIMARY TOOL. Use this instead of multiple ctx_execute() calls.\n\n" +
+      "One ctx_batch_execute call replaces 30+ ctx_execute calls + 10+ ctx_search calls.\n" +
       "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
       "THINK IN CODE: When commands produce data you need to analyze, add processing commands that filter and summarize. Don't pull raw output into context — let the sandbox do the work.\n\n" +
       "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
@@ -1767,7 +1880,7 @@ server.registerTool(
       }
 
       // Run all search queries — source scoped only.
-      // Cross-source search remains available via explicit search().
+      // Cross-source search remains available via explicit ctx_search().
       const queryResults = formatBatchQueryResults(store, queries, source);
 
       // Get searchable terms for edge cases where follow-up is needed
@@ -1836,6 +1949,12 @@ server.registerTool(
   async () => {
     // ONE call, ONE source — AnalyticsEngine.queryAll()
     let text: string;
+    // Lifetime stats (across all SessionDBs + auto-memory) — best-effort.
+    let lifetime;
+    try {
+      lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
+    } catch { /* ignore — formatReport tolerates undefined */ }
+
     try {
       const dbHash = hashProjectDir();
       const worktreeSuffix = getWorktreeSuffix();
@@ -1850,7 +1969,7 @@ server.registerTool(
         try {
           const engine = new AnalyticsEngine(sdb);
           const report = engine.queryAll(sessionStats);
-          text = formatReport(report, VERSION, _latestVersion);
+          text = formatReport(report, VERSION, _latestVersion, { lifetime });
         } finally {
           sdb.close();
         }
@@ -1858,13 +1977,13 @@ server.registerTool(
         // No session DB — build a minimal report from runtime stats only
         const engine = new AnalyticsEngine(createMinimalDb());
         const report = engine.queryAll(sessionStats);
-        text = formatReport(report, VERSION, _latestVersion);
+        text = formatReport(report, VERSION, _latestVersion, { lifetime });
       }
     } catch {
       // Session DB not available or incompatible — build minimal report from runtime stats
       const engine = new AnalyticsEngine(createMinimalDb());
       const report = engine.queryAll(sessionStats);
-      text = formatReport(report, VERSION, _latestVersion);
+      text = formatReport(report, VERSION, _latestVersion, { lifetime });
     }
 
     return trackResponse("ctx_stats", {
@@ -1994,9 +2113,9 @@ server.registerTool(
     let cmd: string;
 
     if (existsSync(bundlePath)) {
-      cmd = `node "${bundlePath}" upgrade`;
+      cmd = `${buildNodeCommand(bundlePath)} upgrade`;
     } else if (existsSync(fallbackPath)) {
-      cmd = `node "${fallbackPath}" upgrade`;
+      cmd = `${buildNodeCommand(fallbackPath)} upgrade`;
     } else {
       // Inline fallback: neither CLI file exists (e.g. marketplace installs).
       // Generate a self-contained node -e script that performs the upgrade.
@@ -2044,7 +2163,7 @@ server.registerTool(
       const tmpScript = resolve(pluginRoot, ".ctx-upgrade-inline.mjs");
       const { writeFileSync: writeTmp } = await import("node:fs");
       writeTmp(tmpScript, scriptLines);
-      cmd = `node "${tmpScript}"`;
+      cmd = buildNodeCommand(tmpScript);
     }
 
     const text = [
@@ -2178,15 +2297,23 @@ server.registerTool(
       "First run installs dependencies (~30s). Subsequent runs open instantly.",
     inputSchema: z.object({
       port: z.coerce.number().optional().describe("Port to serve on (default: 4747)"),
+      sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
+      contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
+      insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
+      insightContentDir: z.string().optional().describe("Alias for contentDir / INSIGHT_CONTENT_DIR"),
     }),
   },
-  async ({ port: userPort }) => {
+  async ({ port: userPort, sessionDir, contentDir: inputContentDir, insightSessionDir, insightContentDir }) => {
     const port = userPort || 4747;
+    const userSessionDir = sessionDir || insightSessionDir;
+    const userContentDir = inputContentDir || insightContentDir;
     // __pkg_dir is build/ for tsc, plugin root for bundle — resolve to plugin root
     const pluginRoot = existsSync(resolve(__pkg_dir, "package.json")) ? __pkg_dir : dirname(__pkg_dir);
     const insightSource = resolve(pluginRoot, "insight");
-    // Use adapter-aware path: derive from sessions dir (works across all 12 adapters)
-    const sessDir = getSessionDir();
+    // Use adapter-aware path by default, with explicit overrides for hosts whose
+    // MCP adapter/session DB lives outside the detected default path.
+    const sessDir = userSessionDir ? resolve(userSessionDir) : getSessionDir();
+    const contentDir = userContentDir ? resolve(userContentDir) : join(dirname(sessDir), "content");
     const cacheDir = join(dirname(sessDir), "insight-cache");
 
     // Verify source exists
@@ -2265,9 +2392,10 @@ server.registerTool(
         // Port is free, proceed with spawn
       }
 
-      if (portOccupied && sourceUpdated) {
-        // Source was updated but stale server is running on port — kill it so fresh code runs
-        steps.push("Killing stale dashboard server (source updated)...");
+      if (portOccupied && (sourceUpdated || userSessionDir || userContentDir)) {
+        // Source or data-dir configuration changed while a server is already running —
+        // kill it so fresh code/env runs.
+        steps.push(sourceUpdated ? "Killing stale dashboard server (source updated)..." : "Killing existing dashboard server (data dir override)...");
         try {
           if (process.platform === "win32") {
             execSync(`for /f "tokens=5" %a in ('netstat -ano ^| findstr :${port}') do taskkill /F /PID %a`, { stdio: "pipe" });
@@ -2307,8 +2435,8 @@ server.registerTool(
         env: {
           ...process.env,
           PORT: String(port),
-          INSIGHT_SESSION_DIR: getSessionDir(),
-          INSIGHT_CONTENT_DIR: join(dirname(getSessionDir()), "content"),
+          INSIGHT_SESSION_DIR: sessDir,
+          INSIGHT_CONTENT_DIR: contentDir,
           INSIGHT_PARENT_PID: String(process.pid),
         },
         detached: true,
@@ -2352,6 +2480,8 @@ server.registerTool(
         else execSync(`xdg-open "${url}" 2>/dev/null || sensible-browser "${url}" 2>/dev/null`, { stdio: "pipe" });
       } catch { /* browser open is best-effort */ }
 
+      if (userSessionDir) steps.push(`Session dir: ${sessDir}`);
+      if (userContentDir) steps.push(`Content dir: ${contentDir}`);
       steps.push(`Dashboard running at ${url}`);
 
       return trackResponse("ctx_insight", {
