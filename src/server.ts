@@ -1484,6 +1484,15 @@ server.registerTool(
       });
     }
 
+    // Apply Read deny-policy to prevent indexing sensitive files into the
+    // FTS5 store, which would otherwise be queryable via ctx_search and
+    // exfiltrate content into the model's context (issue #442). Mirrors the
+    // check ctx_execute_file already performs.
+    if (path) {
+      const pathDenied = checkFilePathDenyPolicy(path, "ctx_index");
+      if (pathDenied) return pathDenied;
+    }
+
     try {
       const resolvedPath = path ? resolveProjectPath(path) : undefined;
       // Track the raw bytes being indexed (content or file)

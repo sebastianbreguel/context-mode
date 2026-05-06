@@ -1183,6 +1183,207 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+// ctx_index: Read deny-policy enforcement (#442)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Real-MCP integration test: ctx_execute_file calls checkFilePathDenyPolicy
+// before reading the file, but ctx_index historically skipped the check —
+// any file readable by the MCP server process could be indexed into FTS5
+// and exfiltrated through ctx_search. This pins the fix end-to-end via
+// JSON-RPC against a freshly spawned server with .claude/settings.json
+// containing a Read deny pattern matching the target file.
+
+describe("ctx_index: Read deny-policy enforcement (#442)", () => {
+  const projectDir = mkdtempSync(join(tmpdir(), "ctx-index-deny-"));
+  const secretFile = "secret.env";
+  const allowedFile = "public-doc.md";
+  const secretMarker = `secret-marker-${process.pid}-${Date.now()}`;
+  const allowedMarker = `allowed-marker-${process.pid}-${Date.now()}`;
+
+  beforeAll(() => {
+    mkdirSync(join(projectDir, ".claude"), { recursive: true });
+    writeFileSync(
+      join(projectDir, ".claude", "settings.json"),
+      JSON.stringify({
+        permissions: {
+          deny: ["Read(./secret.env)", "Read(secret.env)"],
+        },
+      }),
+      "utf-8",
+    );
+    writeFileSync(
+      join(projectDir, secretFile),
+      `SECRET_TOKEN=${secretMarker}\n`,
+      "utf-8",
+    );
+    writeFileSync(
+      join(projectDir, allowedFile),
+      `# Public doc\n\n${allowedMarker}\n`,
+      "utf-8",
+    );
+  });
+
+  afterAll(() => {
+    rmSync(projectDir, { recursive: true, force: true });
+  });
+
+  function spawnServerInProject(): ChildProcess {
+    return spawn("node", [mcpEntry], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        CONTEXT_MODE_DISABLE_VERSION_CHECK: "1",
+        CLAUDE_PROJECT_DIR: projectDir,
+      },
+    });
+  }
+
+  async function awaitRpc(
+    proc: ChildProcess,
+    id: number,
+    request: Record<string, unknown>,
+    timeoutMs = 15_000,
+  ): Promise<DoctorJsonRpcResponse | undefined> {
+    return new Promise((resolve) => {
+      let buffer = "";
+      const onData = (d: Buffer) => {
+        buffer += d.toString();
+        let idx: number;
+        while ((idx = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, idx).trim();
+          buffer = buffer.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line) as DoctorJsonRpcResponse;
+            if (parsed.id === id) {
+              proc.stdout!.off("data", onData);
+              clearTimeout(timer);
+              resolve(parsed);
+              return;
+            }
+          } catch { /* ignore */ }
+        }
+      };
+      const timer = setTimeout(() => {
+        proc.stdout!.off("data", onData);
+        resolve(undefined);
+      }, timeoutMs);
+      proc.stdout!.on("data", onData);
+      sendRpc(proc, request);
+    });
+  }
+
+  test("ctx_index({ path: <denied> }) returns deny-policy error and never indexes", async () => {
+    const proc = spawnServerInProject();
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-deny-442", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      // Attempt to index the denied file.
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "ctx_index", arguments: { path: secretFile } },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      expect(indexResp?.result?.isError).toBe(true);
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      expect(indexText).toContain("blocked by security policy");
+      expect(indexText).toContain("Read deny pattern");
+      // Critical: no "Indexed N section" success message.
+      expect(indexText).not.toMatch(/Indexed \d+ section/);
+
+      // Cross-check: the secret marker is NOT queryable via ctx_search.
+      // If the deny check were bypassed, the file's content would be
+      // chunked into FTS5 and surface here.
+      const searchResp = await awaitRpc(proc, 101, {
+        jsonrpc: "2.0", id: 101, method: "tools/call",
+        params: { name: "ctx_search", arguments: { queries: [secretMarker] } },
+      });
+      expect(searchResp?.error).toBeUndefined();
+      const searchText = searchResp?.result?.content?.[0]?.text ?? "";
+      // Search echoes the query, so a substring match on `secretMarker` would
+      // false-positive. Two valid empty-store signals prove the FTS5 store
+      // never received the file's content: "No results found" (store has
+      // other indexed content but no marker hit) or the empty-store guidance
+      // ("After indexing, ctx_search becomes available") when nothing was
+      // indexed at all this run.
+      const searchedEmpty =
+        searchText.includes("No results found") ||
+        searchText.includes("After indexing");
+      expect(searchedEmpty).toBe(true);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+
+  test("ctx_index({ path: <allowed> }) succeeds and is searchable", async () => {
+    const proc = spawnServerInProject();
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-allow-442", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: { name: "ctx_index", arguments: { path: allowedFile } },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      expect(indexResp?.result?.isError).toBeFalsy();
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      expect(indexText).toMatch(/Indexed \d+ section/);
+
+      const searchResp = await awaitRpc(proc, 101, {
+        jsonrpc: "2.0", id: 101, method: "tools/call",
+        params: { name: "ctx_search", arguments: { queries: [allowedMarker] } },
+      });
+      expect(searchResp?.error).toBeUndefined();
+      const searchText = searchResp?.result?.content?.[0]?.text ?? "";
+      expect(searchText).toContain(allowedMarker);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+
+  test("ctx_index({ content: ... }) bypass branch is unaffected by deny-policy", async () => {
+    const proc = spawnServerInProject();
+    try {
+      await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-index-content-442", version: "1.0" } },
+      });
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      // No `path` — caller passed inline content. Deny-policy gate must skip.
+      const inlineMarker = `inline-marker-${process.pid}-${Date.now()}`;
+      const indexResp = await awaitRpc(proc, 100, {
+        jsonrpc: "2.0", id: 100, method: "tools/call",
+        params: {
+          name: "ctx_index",
+          arguments: {
+            content: `# Inline\n\n${inlineMarker}\n`,
+            source: "test-inline",
+          },
+        },
+      });
+
+      expect(indexResp?.error).toBeUndefined();
+      expect(indexResp?.result?.isError).toBeFalsy();
+      const indexText = indexResp?.result?.content?.[0]?.text ?? "";
+      expect(indexText).toMatch(/Indexed \d+ section/);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 30_000);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 // ctx_execute_file: projectRoot env cascade parity with ctx_index
 // ═══════════════════════════════════════════════════════════════════════════
 //
