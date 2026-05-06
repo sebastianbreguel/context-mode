@@ -26,7 +26,22 @@ import {
   hasBunRuntime,
   getAvailableLanguages,
 } from "./runtime.js";
-import { browserOpenArgv } from "./process-utils.js";
+// Private 16-LOC copy of browserOpenArgv. Canonical version lives in src/server.ts;
+// duplicated here so the cli bundle does not pull server.ts top-level boot side effects.
+// Keep in sync — pure data, no I/O.
+function browserOpenArgv(
+  url: string,
+  platform: NodeJS.Platform,
+): readonly { cmd: string; args: readonly string[] }[] {
+  if (platform === "darwin") return [{ cmd: "open", args: [url] }];
+  if (platform === "win32") {
+    return [{ cmd: "cmd", args: ["/c", "start", "", url] }];
+  }
+  return [
+    { cmd: "xdg-open", args: [url] },
+    { cmd: "sensible-browser", args: [url] },
+  ];
+}
 
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
@@ -192,8 +207,8 @@ export function openInBrowser(
   const hint = () =>
     console.error(`\nCould not auto-open browser. Open manually: ${url}`);
 
-  // Shared platform→argv mapping lives in process-utils so server.ts and
-  // cli.ts cannot drift out of sync.
+  // Platform→argv mapping is canonical in src/server.ts; mirrored privately
+  // above to avoid pulling server boot side effects into the cli bundle.
   const attempts = browserOpenArgv(url, platform);
   let opened = false;
   for (const { cmd, args } of attempts) {
