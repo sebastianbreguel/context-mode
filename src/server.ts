@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, spawnSync, type ChildProcess } from "node:child_process";
+import { openBrowserSync, killProcessOnPort } from "./process-utils.js";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
@@ -2846,60 +2847,7 @@ server.registerTool(
   },
 );
 
-// ── ctx-insight helpers: cross-platform browser-open and port-kill ───────────
-//
-// Both helpers use spawnSync with argv arrays — never `sh -c <string>` — so
-// caller-derived values (port, url) cannot escape into shell context.
-// Replaces six execSync template-string sites in the ctx_insight handler that
-// previously interpolated `port` and `url` into double-quoted shell commands.
-// See issue #441.
-
-function openBrowserBestEffort(url: string): void {
-  try {
-    if (process.platform === "darwin") {
-      spawnSync("open", [url], { stdio: "ignore" });
-    } else if (process.platform === "win32") {
-      // `cmd /c start "" "<url>"` — `start` is a cmd builtin, no PowerShell.
-      // The empty title arg ("") prevents `start` from interpreting the URL
-      // as a window title. spawnSync passes argv unmodified to cmd, which
-      // does not perform shell-style metacharacter expansion on argv beyond
-      // its own quoting rules — meaningfully tighter than `execSync(\`start "" "${url}"\`)`.
-      spawnSync("cmd", ["/c", "start", "", url], { stdio: "ignore" });
-    } else {
-      const xdg = spawnSync("xdg-open", [url], { stdio: "ignore" });
-      if (xdg.error || (xdg.status !== null && xdg.status !== 0)) {
-        spawnSync("sensible-browser", [url], { stdio: "ignore" });
-      }
-    }
-  } catch { /* best-effort — failures are silent on the original code path */ }
-}
-
-function killProcessOnPort(port: number): void {
-  try {
-    if (process.platform === "win32") {
-      const r = spawnSync("netstat", ["-ano"], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-      if (r.status !== 0 || typeof r.stdout !== "string") return;
-      const portTag = `:${port}`;
-      const pids = new Set<string>();
-      for (const line of r.stdout.split(/\r?\n/)) {
-        if (!line.includes(portTag)) continue;
-        const tokens = line.trim().split(/\s+/);
-        const pid = tokens[tokens.length - 1];
-        if (pid && /^\d+$/.test(pid)) pids.add(pid);
-      }
-      for (const pid of pids) {
-        spawnSync("taskkill", ["/F", "/PID", pid], { stdio: "ignore" });
-      }
-    } else {
-      const r = spawnSync("lsof", ["-ti", `:${port}`], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
-      if (r.status !== 0 || typeof r.stdout !== "string") return;
-      for (const pid of r.stdout.split(/\r?\n/).filter(Boolean)) {
-        if (!/^\d+$/.test(pid)) continue;
-        spawnSync("kill", [pid], { stdio: "ignore" });
-      }
-    }
-  } catch { /* best-effort — failures are silent on the original code path */ }
-}
+// ctx_insight helpers live in src/process-utils.ts (issue #441) — see top-level import.
 
 // ── ctx-insight: analytics dashboard ──────────────────────────────────────────
 server.registerTool(
@@ -3011,16 +2959,38 @@ server.registerTool(
       if (portOccupied && sourceUpdated) {
         // Source was updated but stale server is running on port — kill it so fresh code runs
         steps.push("Killing stale dashboard server (source updated)...");
-        killProcessOnPort(port);
+        const kill = killProcessOnPort(port);
+        if (kill.attemptedPids.length > 0 && kill.killedPids.length === 0) {
+          // Tried to kill, every attempt failed (perms, race, missing binary).
+          // Surface so the agent doesn't loop on the same port forever.
+          return trackResponse("ctx_insight", {
+            content: [{
+              type: "text" as const,
+              text: `Could not free port ${port} (kill failed for ${kill.attemptedPids.join(", ")}: ${kill.errors.join("; ")}). Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
+            }],
+          });
+        }
+        if (kill.errors.length > 0 && kill.attemptedPids.length === 0) {
+          // Couldn't even probe the port (e.g. lsof not installed).
+          return trackResponse("ctx_insight", {
+            content: [{
+              type: "text" as const,
+              text: `Cannot reclaim port ${port}: ${kill.errors.join("; ")}. Stop the process manually or pick another port.`,
+            }],
+          });
+        }
         await new Promise(r => setTimeout(r, 500)); // Wait for port to free
-        steps.push("Stale server killed.");
+        steps.push(`Stale server killed (${kill.killedPids.length} pid${kill.killedPids.length === 1 ? "" : "s"}).`);
       } else if (portOccupied) {
         // Source unchanged, server is running fine — just open browser
         steps.push("Dashboard already running.");
         const url = `http://localhost:${port}`;
-        openBrowserBestEffort(url);
+        const open = openBrowserSync(url);
+        const tail = open.ok
+          ? ""
+          : ` (auto-open failed: ${open.reason}; navigate manually)`;
         return trackResponse("ctx_insight", {
-          content: [{ type: "text" as const, text: `Dashboard already running at http://localhost:${port}` }],
+          content: [{ type: "text" as const, text: `Dashboard already running at ${url}${tail}` }],
         });
       }
 
@@ -3077,9 +3047,10 @@ server.registerTool(
 
       // Open browser (cross-platform)
       const url = `http://localhost:${port}`;
-      openBrowserBestEffort(url);
+      const open = openBrowserSync(url);
+      const openTail = open.ok ? "" : ` (auto-open failed: ${open.reason}; navigate manually)`;
 
-      steps.push(`Dashboard running at ${url}`);
+      steps.push(`Dashboard running at ${url}${openTail}`);
 
       return trackResponse("ctx_insight", {
         content: [{

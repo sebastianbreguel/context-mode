@@ -1,0 +1,164 @@
+// Cross-platform process helpers used by ctx_insight (server.ts) and the
+// dashboard launcher in cli.ts. All entry points use argv arrays — never
+// `sh -c <string>` — so caller-derived values cannot escape into shell
+// context. See issue #441.
+
+import { spawnSync as nodeSpawnSync } from "node:child_process";
+import type { SpawnSyncOptions, SpawnSyncReturns } from "node:child_process";
+
+export type SpawnSyncFn = (
+  cmd: string,
+  args: readonly string[],
+  opts?: SpawnSyncOptions,
+) => SpawnSyncReturns<string | Buffer>;
+
+export type BrowserOpenResult =
+  | { ok: true; method: string }
+  | { ok: false; method: "none"; reason: string };
+
+export type KillResult = {
+  killedPids: string[];
+  attemptedPids: string[];
+  errors: string[];
+};
+
+// Returns the argv attempts for opening `url` on `platform`, in fall-back order.
+// Pure data — no I/O. Shared by sync (server) and async (cli) callers.
+export function browserOpenArgv(
+  url: string,
+  platform: NodeJS.Platform,
+): readonly { cmd: string; args: readonly string[] }[] {
+  if (platform === "darwin") return [{ cmd: "open", args: [url] }];
+  if (platform === "win32") {
+    // `start` is a cmd.exe builtin; the empty title arg ("") prevents the URL
+    // from being consumed as the window title.
+    return [{ cmd: "cmd", args: ["/c", "start", "", url] }];
+  }
+  // linux/bsd: try xdg-open, then sensible-browser (Debian/Ubuntu).
+  return [
+    { cmd: "xdg-open", args: [url] },
+    { cmd: "sensible-browser", args: [url] },
+  ];
+}
+
+// Opens a browser synchronously, waiting for each attempt to complete.
+// Returns a structured result so callers can surface auto-open failures
+// to the user instead of falsely reporting success.
+export function openBrowserSync(
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+  runner: SpawnSyncFn = nodeSpawnSync,
+): BrowserOpenResult {
+  const attempts = browserOpenArgv(url, platform);
+  const errors: string[] = [];
+  for (const { cmd, args } of attempts) {
+    try {
+      const r = runner(cmd, args, { stdio: "ignore" });
+      // Treat signal-kill (status === null) and any non-zero status as failure
+      // so the next fallback fires.
+      if (!r.error && r.status === 0) return { ok: true, method: cmd };
+      const reason = r.error?.message ?? `status=${r.status === null ? "signaled" : r.status}`;
+      errors.push(`${cmd}: ${reason}`);
+    } catch (e) {
+      errors.push(`${cmd}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return { ok: false, method: "none", reason: errors.join("; ") };
+}
+
+// Kills any process listening on `port`. Returns a structured result so
+// the caller can distinguish between (a) port was free, (b) kill succeeded,
+// (c) kill failed (perms, missing binary, or per-pid failure mid-loop).
+//
+// On Windows the netstat parser is anchored on the LOCAL address column and
+// the LISTENING state — required to avoid cross-matching a remote-port column
+// and force-killing unrelated processes that happen to have an outbound
+// connection to the same port number.
+export function killProcessOnPort(
+  port: number,
+  platform: NodeJS.Platform = process.platform,
+  runner: SpawnSyncFn = nodeSpawnSync,
+): KillResult {
+  const result: KillResult = { killedPids: [], attemptedPids: [], errors: [] };
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    result.errors.push(`invalid port: ${port}`);
+    return result;
+  }
+
+  try {
+    if (platform === "win32") {
+      const r = runner("netstat", ["-ano"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (r.error) {
+        result.errors.push(`netstat: ${r.error.message}`);
+        return result;
+      }
+      if (r.status !== 0 || typeof r.stdout !== "string") return result;
+
+      const portSuffix = `:${port}`;
+      const pids = new Set<string>();
+      for (const rawLine of r.stdout.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const tokens = line.split(/\s+/);
+        // netstat -ano LISTENING row: "TCP  0.0.0.0:4747  0.0.0.0:0  LISTENING  1234"
+        if (tokens.length < 5) continue;
+        const [proto, local, , state, pid] = tokens;
+        if (proto !== "TCP") continue;
+        if (state !== "LISTENING") continue;
+        if (!local.endsWith(portSuffix)) continue;
+        if (!/^\d+$/.test(pid)) continue;
+        pids.add(pid);
+      }
+      for (const pid of pids) {
+        result.attemptedPids.push(pid);
+        try {
+          const k = runner("taskkill", ["/F", "/PID", pid], { stdio: "ignore" });
+          if (k.error || k.status !== 0) {
+            result.errors.push(
+              `taskkill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
+            );
+          } else {
+            result.killedPids.push(pid);
+          }
+        } catch (e) {
+          result.errors.push(`taskkill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    } else {
+      const r = runner("lsof", ["-ti", `:${port}`], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (r.error) {
+        // ENOENT (lsof not installed) is a real diagnostic; surface it.
+        result.errors.push(`lsof: ${r.error.message}`);
+        return result;
+      }
+      // lsof exits 1 with empty stdout when the port is free — not an error.
+      if (r.status !== 0 || typeof r.stdout !== "string") return result;
+
+      const pids = r.stdout.split(/\r?\n/).filter(p => /^\d+$/.test(p));
+      for (const pid of pids) {
+        result.attemptedPids.push(pid);
+        try {
+          const k = runner("kill", [pid], { stdio: "ignore" });
+          if (k.error || k.status !== 0) {
+            result.errors.push(
+              `kill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
+            );
+          } else {
+            result.killedPids.push(pid);
+          }
+        } catch (e) {
+          result.errors.push(`kill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+  } catch (e) {
+    result.errors.push(e instanceof Error ? e.message : String(e));
+  }
+  return result;
+}

@@ -26,6 +26,7 @@ import {
   hasBunRuntime,
   getAvailableLanguages,
 } from "./runtime.js";
+import { browserOpenArgv } from "./process-utils.js";
 
 // ── Adapter imports ──────────────────────────────────────
 import { detectPlatform, getAdapter } from "./adapters/detect.js";
@@ -191,28 +192,18 @@ export function openInBrowser(
   const hint = () =>
     console.error(`\nCould not auto-open browser. Open manually: ${url}`);
 
-  try {
-    if (platform === "darwin") {
-      runner("open", [url], opts);
-    } else if (platform === "win32") {
-      // `start` is a cmd.exe builtin; first arg after `start` is the
-      // window title — pass empty so the URL isn't consumed as a title.
-      runner("cmd", ["/c", "start", "", url], opts);
-    } else {
-      // linux/bsd: try xdg-open, fall back to sensible-browser.
-      try {
-        runner("xdg-open", [url], opts);
-      } catch {
-        try {
-          runner("sensible-browser", [url], opts);
-        } catch {
-          hint();
-        }
-      }
-    }
-  } catch {
-    hint();
+  // Shared platform→argv mapping lives in process-utils so server.ts and
+  // cli.ts cannot drift out of sync.
+  const attempts = browserOpenArgv(url, platform);
+  let opened = false;
+  for (const { cmd, args } of attempts) {
+    try {
+      runner(cmd, args as string[], opts);
+      opened = true;
+      break;
+    } catch { /* try next fallback */ }
   }
+  if (!opened) hint();
 }
 
 function defaultPluginRoot(): string {

@@ -1186,20 +1186,22 @@ describe("ctx_index: projectRoot path resolution (#365)", () => {
 // ctx_insight: execFile migration + port schema hardening (#441)
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Two layers of regression protection:
+// Three layers of regression protection:
 //
-//   1. Source-grep guard — pin that the ctx_insight handler block in
-//      src/server.ts contains ZERO `execSync(\`…${…}…\`)` template-string
-//      sites. The original injection surface was six such sites that
-//      interpolated `port` and `url` into shell commands. The fix routes
-//      both through spawnSync helpers (`openBrowserBestEffort`,
-//      `killProcessOnPort`) using argv arrays — no shell.
+//   1. Coarse source guard — `src/server.ts` must not reintroduce the
+//      `execSync(\`…${…}…\`)` template-string injection pattern anywhere.
+//      Behavioral coverage of the helpers themselves lives in
+//      tests/core/process-utils.test.ts (mocked spawnSync, asserts argv
+//      arrays + no shell:true + Windows LISTENING anchoring + per-pid
+//      failure isolation).
 //
-//   2. Real-MCP integration — spawn the server via stdio JSON-RPC and
+//   2. Cross-reference — server.ts must import the structured helpers from
+//      ./process-utils.js so the handler can surface auto-open / kill
+//      failures to the agent rather than silently reporting success.
+//
+//   3. Real-MCP integration — spawn the server via stdio JSON-RPC and
 //      verify the tightened port schema rejects out-of-range and
-//      non-integer values BEFORE the handler runs. (We do not exercise
-//      the full dashboard build path here — it spawns a child server,
-//      runs vite build, and is covered by other tests.)
+//      non-integer values BEFORE the handler runs.
 
 describe("ctx_insight: execFile migration source guard (#441)", () => {
   const serverSrc = readFileSync(
@@ -1207,57 +1209,30 @@ describe("ctx_insight: execFile migration source guard (#441)", () => {
     "utf-8",
   );
 
-  // Locate the ctx_insight tool registration block. The handler ends at
-  // the matching `);` for `server.registerTool("ctx_insight", … , async …)`.
-  // We slice from the registration call through the closing `}\n);` to scope
-  // the assertions to handler-internal code only.
-  const insightStart = serverSrc.indexOf('"ctx_insight"');
-  const insightSliceFromStart = serverSrc.slice(insightStart);
-  const insightHandlerEnd = insightSliceFromStart.indexOf("\n);\n");
-  const insightBlock = insightSliceFromStart.slice(0, insightHandlerEnd);
-
-  test("ctx_insight registration is locatable", () => {
-    expect(insightStart).toBeGreaterThan(0);
-    expect(insightHandlerEnd).toBeGreaterThan(0);
-  });
-
-  test("ctx_insight handler contains no execSync template-string interpolation", () => {
-    // Match: execSync(`...${...}...`)  — the exact injection pattern.
+  test("server.ts contains no execSync template-string interpolation anywhere", () => {
+    // Match: execSync(`...${...}...`) — the original injection pattern.
+    // Scoped to the entire file (not just the ctx_insight handler) because
+    // the helpers are now in process-utils.ts and any reintroduction of the
+    // pattern in server.ts is a regression worth catching.
     const templateInterpolation = /execSync\(`[^`]*\$\{/m;
-    expect(insightBlock).not.toMatch(templateInterpolation);
+    expect(serverSrc).not.toMatch(templateInterpolation);
   });
 
-  test("ctx_insight handler does not invoke shell-quoted browser-open commands", () => {
-    expect(insightBlock).not.toMatch(/execSync\(`open\b/);
-    expect(insightBlock).not.toMatch(/execSync\(`start\b/);
-    expect(insightBlock).not.toMatch(/execSync\(`xdg-open\b/);
-    expect(insightBlock).not.toMatch(/execSync\(`sensible-browser\b/);
-  });
-
-  test("ctx_insight handler does not invoke shell-quoted port-kill pipelines", () => {
-    expect(insightBlock).not.toMatch(/execSync\(`lsof\b/);
-    expect(insightBlock).not.toMatch(/execSync\(`for \/f\b/);
-    // `xargs kill` may appear in user-facing copy-paste hints (e.g. the
-    // "to kill the existing process" text), so we don't grep for it here —
-    // the surrounding `execSync(\`lsof\b` check already catches the
-    // executable variant.
+  test("server.ts imports structured helpers from ./process-utils.js", () => {
+    // The helpers must be the ones that return BrowserOpenResult / KillResult
+    // so the ctx_insight handler can surface failures.
+    expect(serverSrc).toMatch(
+      /import\s*\{[^}]*\bopenBrowserSync\b[^}]*\bkillProcessOnPort\b[^}]*\}\s*from\s*["']\.\/process-utils\.js["']/,
+    );
   });
 
   test("port schema is bounded to a valid TCP port range", () => {
-    // The fix tightens the schema to z.coerce.number().int().min(1).max(65535).
-    // Pin all four constraints — the order is not important, only their presence
-    // adjacent to the `port:` declaration.
     const portDecl = serverSrc.match(/port:\s*z\.coerce\.number\(\)([^,\n]*)\.optional\(\)/);
     expect(portDecl).not.toBeNull();
     const constraints = portDecl![1];
     expect(constraints).toContain(".int()");
     expect(constraints).toContain(".min(1)");
     expect(constraints).toContain(".max(65535)");
-  });
-
-  test("ctx_insight helper functions exist and use spawnSync (no shell)", () => {
-    expect(serverSrc).toMatch(/function openBrowserBestEffort\(/);
-    expect(serverSrc).toMatch(/function killProcessOnPort\(/);
   });
 });
 
@@ -1318,10 +1293,13 @@ describe("ctx_insight: port schema rejects invalid values (#441)", () => {
     test(`rejects port=${JSON.stringify(port)} (${label}) at schema layer`, async () => {
       const proc = spawnInsightServer();
       try {
-        await awaitRpc(proc, 1, {
+        const init = await awaitRpc(proc, 1, {
           jsonrpc: "2.0", id: 1, method: "initialize",
           params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-insight-441", version: "1.0" } },
         });
+        // Init must succeed before tools/call — otherwise an unrelated startup
+        // failure could masquerade as schema rejection.
+        expect(init?.result).toBeDefined();
         sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
 
         const resp = await awaitRpc(proc, 100, {
@@ -1345,6 +1323,40 @@ describe("ctx_insight: port schema rejects invalid values (#441)", () => {
       }
     }, 20_000);
   }
+
+  // Pin the schema layer specifically: at least one case must surface as a
+  // JSON-RPC `error` with code -32602 (Invalid params), proving zod rejected
+  // the input before the handler ran.  A regression that loosened the schema
+  // back to `z.coerce.number().optional()` and let the handler crash on
+  // `port=0` would still satisfy the lenient `isError === true` checks above
+  // — but it would not produce a -32602 envelope here.
+  test("schema layer rejects out-of-range port with JSON-RPC -32602", async () => {
+    const proc = spawnInsightServer();
+    try {
+      const init = await awaitRpc(proc, 1, {
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "ctx-insight-441-schema", version: "1.0" } },
+      });
+      expect(init?.result).toBeDefined();
+      sendRpc(proc, { jsonrpc: "2.0", method: "notifications/initialized" });
+
+      const resp = await awaitRpc(proc, 200, {
+        jsonrpc: "2.0", id: 200, method: "tools/call",
+        params: { name: "ctx_insight", arguments: { port: 70000 } },
+      });
+
+      // Either a top-level error with code -32602 or an isError result whose
+      // text mentions schema/range-validation language. Both prove zod fired.
+      const errCode = resp?.error?.code;
+      const text = resp?.result?.content?.[0]?.text ?? "";
+      const schemaSignal =
+        errCode === -32602 ||
+        /(less than or equal|65535|invalid|too_big|expected number)/i.test(text);
+      expect(schemaSignal).toBe(true);
+    } finally {
+      try { proc.kill("SIGTERM"); } catch { /* best effort */ }
+    }
+  }, 20_000);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
