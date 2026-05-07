@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
-import { execSync, type ChildProcess } from "node:child_process";
+import { execSync, spawnSync, type ChildProcess, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
@@ -2706,14 +2706,11 @@ server.registerTool(
       // Inline fallback: neither CLI file exists (e.g. marketplace installs).
       // Generate a self-contained node -e script that performs the upgrade.
       const repoUrl = "https://github.com/mksglu/context-mode.git";
-      const copyDirs = ["build", "hooks", "skills", "scripts", ".claude-plugin"];
-      const copyFiles = ["start.mjs", "server.bundle.mjs", "cli.bundle.mjs", "package.json"];
-
       // Write inline script to a temp .mjs file — avoids quote-escaping issues
       // across cmd.exe, PowerShell, and bash (node -e '...' breaks on Windows).
       const scriptLines = [
         `import{execFileSync}from"node:child_process";`,
-        `import{cpSync,rmSync,existsSync,mkdtempSync}from"node:fs";`,
+        `import{cpSync,rmSync,existsSync,mkdtempSync,readFileSync,writeFileSync}from"node:fs";`,
         `import{join}from"node:path";`,
         `import{tmpdir}from"node:os";`,
         `const P=${JSON.stringify(pluginRoot)};`,
@@ -2725,15 +2722,11 @@ server.registerTool(
         `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
         `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["run","build"],{cwd:T,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Built from source");`,
-        ...copyDirs.map(
-          (d) =>
-            `if(existsSync(join(T,${JSON.stringify(d)})))cpSync(join(T,${JSON.stringify(d)}),join(P,${JSON.stringify(d)}),{recursive:true,force:true});`,
-        ),
-        ...copyFiles.map(
-          (f) =>
-            `if(existsSync(join(T,${JSON.stringify(f)})))cpSync(join(T,${JSON.stringify(f)}),join(P,${JSON.stringify(f)}),{force:true});`,
-        ),
-        `console.log("- [x] Copied build artifacts");`,
+        `const pkg=JSON.parse(readFileSync(join(T,"package.json"),"utf8"));`,
+        `const items=[...(Array.isArray(pkg.files)?pkg.files:[]),"src","package.json"];`,
+        `for(const item of items){const from=join(T,item);const to=join(P,item);if(existsSync(from)){rmSync(to,{recursive:true,force:true});cpSync(from,to,{recursive:true,force:true});}}`,
+        `writeFileSync(join(P,".mcp.json"),JSON.stringify({mcpServers:{"context-mode":{command:"node",args:["\${CLAUDE_PLUGIN_ROOT}/start.mjs"]}}},null,2)+"\\n");`,
+        `console.log("- [x] Copied package files");`,
         `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install","--production"],{cwd:P,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Installed production dependencies");`,
         `console.log("## context-mode upgrade complete");`,
@@ -2877,6 +2870,171 @@ server.registerTool(
   },
 );
 
+// ── ctx_insight process helpers ──────────────────────────────────────────────
+// Cross-platform process helpers used by ctx_insight (below) and the dashboard
+// launcher in cli.ts. All entry points use argv arrays — never `sh -c <string>`
+// — so caller-derived values cannot escape into shell context. See issue #441.
+//
+// `browserOpenArgv` is duplicated as a private 16-LOC copy in cli.ts to avoid
+// pulling server.ts top-level boot side effects into the cli bundle.
+
+export type SpawnSyncFn = (
+  cmd: string,
+  args: readonly string[],
+  opts?: SpawnSyncOptions,
+) => SpawnSyncReturns<string | Buffer>;
+
+export type BrowserOpenResult =
+  | { ok: true; method: string }
+  | { ok: false; method: "none"; reason: string };
+
+export type KillResult = {
+  killedPids: string[];
+  attemptedPids: string[];
+  errors: string[];
+};
+
+// Returns the argv attempts for opening `url` on `platform`, in fall-back order.
+// Pure data — no I/O.
+export function browserOpenArgv(
+  url: string,
+  platform: NodeJS.Platform,
+): readonly { cmd: string; args: readonly string[] }[] {
+  if (platform === "darwin") return [{ cmd: "open", args: [url] }];
+  if (platform === "win32") {
+    // `start` is a cmd.exe builtin; the empty title arg ("") prevents the URL
+    // from being consumed as the window title.
+    return [{ cmd: "cmd", args: ["/c", "start", "", url] }];
+  }
+  // linux/bsd: try xdg-open, then sensible-browser (Debian/Ubuntu).
+  return [
+    { cmd: "xdg-open", args: [url] },
+    { cmd: "sensible-browser", args: [url] },
+  ];
+}
+
+// Opens a browser synchronously, waiting for each attempt to complete.
+// Returns a structured result so callers can surface auto-open failures
+// to the user instead of falsely reporting success.
+export function openBrowserSync(
+  url: string,
+  platform: NodeJS.Platform = process.platform,
+  runner: SpawnSyncFn = spawnSync,
+): BrowserOpenResult {
+  const attempts = browserOpenArgv(url, platform);
+  const errors: string[] = [];
+  for (const { cmd, args } of attempts) {
+    try {
+      const r = runner(cmd, args, { stdio: "ignore" });
+      // Treat signal-kill (status === null) and any non-zero status as failure
+      // so the next fallback fires.
+      if (!r.error && r.status === 0) return { ok: true, method: cmd };
+      const reason = r.error?.message ?? `status=${r.status === null ? "signaled" : r.status}`;
+      errors.push(`${cmd}: ${reason}`);
+    } catch (e) {
+      errors.push(`${cmd}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  return { ok: false, method: "none", reason: errors.join("; ") };
+}
+
+// Kills any process listening on `port`. Returns a structured result so
+// the caller can distinguish between (a) port was free, (b) kill succeeded,
+// (c) kill failed (perms, missing binary, or per-pid failure mid-loop).
+//
+// On Windows the netstat parser is anchored on the LOCAL address column and
+// the LISTENING state — required to avoid cross-matching a remote-port column
+// and force-killing unrelated processes that happen to have an outbound
+// connection to the same port number.
+export function killProcessOnPort(
+  port: number,
+  platform: NodeJS.Platform = process.platform,
+  runner: SpawnSyncFn = spawnSync,
+): KillResult {
+  const result: KillResult = { killedPids: [], attemptedPids: [], errors: [] };
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    result.errors.push(`invalid port: ${port}`);
+    return result;
+  }
+
+  try {
+    if (platform === "win32") {
+      const r = runner("netstat", ["-ano"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (r.error) {
+        result.errors.push(`netstat: ${r.error.message}`);
+        return result;
+      }
+      if (r.status !== 0 || typeof r.stdout !== "string") return result;
+
+      const portSuffix = `:${port}`;
+      const pids = new Set<string>();
+      for (const rawLine of r.stdout.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        const tokens = line.split(/\s+/);
+        // netstat -ano LISTENING row: "TCP  0.0.0.0:4747  0.0.0.0:0  LISTENING  1234"
+        if (tokens.length < 5) continue;
+        const [proto, local, , state, pid] = tokens;
+        if (proto !== "TCP") continue;
+        if (state !== "LISTENING") continue;
+        if (!local.endsWith(portSuffix)) continue;
+        if (!/^\d+$/.test(pid)) continue;
+        pids.add(pid);
+      }
+      for (const pid of pids) {
+        result.attemptedPids.push(pid);
+        try {
+          const k = runner("taskkill", ["/F", "/PID", pid], { stdio: "ignore" });
+          if (k.error || k.status !== 0) {
+            result.errors.push(
+              `taskkill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
+            );
+          } else {
+            result.killedPids.push(pid);
+          }
+        } catch (e) {
+          result.errors.push(`taskkill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    } else {
+      const r = runner("lsof", ["-ti", `:${port}`], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      if (r.error) {
+        // ENOENT (lsof not installed) is a real diagnostic; surface it.
+        result.errors.push(`lsof: ${r.error.message}`);
+        return result;
+      }
+      // lsof exits 1 with empty stdout when the port is free — not an error.
+      if (r.status !== 0 || typeof r.stdout !== "string") return result;
+
+      const pids = r.stdout.split(/\r?\n/).filter(p => /^\d+$/.test(p));
+      for (const pid of pids) {
+        result.attemptedPids.push(pid);
+        try {
+          const k = runner("kill", [pid], { stdio: "ignore" });
+          if (k.error || k.status !== 0) {
+            result.errors.push(
+              `kill ${pid}: ${k.error?.message ?? `status=${k.status}`}`,
+            );
+          } else {
+            result.killedPids.push(pid);
+          }
+        } catch (e) {
+          result.errors.push(`kill ${pid}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+    }
+  } catch (e) {
+    result.errors.push(e instanceof Error ? e.message : String(e));
+  }
+  return result;
+}
+
 // ── ctx-insight: analytics dashboard ──────────────────────────────────────────
 server.registerTool(
   "ctx_insight",
@@ -2888,7 +3046,7 @@ server.registerTool(
       "parallel work patterns, project focus, and actionable insights. " +
       "First run installs dependencies (~30s). Subsequent runs open instantly.",
     inputSchema: z.object({
-      port: z.coerce.number().optional().describe("Port to serve on (default: 4747)"),
+      port: z.coerce.number().int().min(1).max(65535).optional().describe("Port to serve on (default: 4747)"),
       sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
       contentDir: z.string().optional().describe("Override INSIGHT_CONTENT_DIR: directory containing context-mode content/index .db files"),
       insightSessionDir: z.string().optional().describe("Alias for sessionDir / INSIGHT_SESSION_DIR"),
@@ -2987,27 +3145,38 @@ server.registerTool(
       if (portOccupied && sourceUpdated) {
         // Source was updated but stale server is running on port — kill it so fresh code runs
         steps.push("Killing stale dashboard server (source updated)...");
-        try {
-          if (process.platform === "win32") {
-            execSync(`for /f "tokens=5" %a in ('netstat -ano ^| findstr :${port}') do taskkill /F /PID %a`, { stdio: "pipe" });
-          } else {
-            execSync(`lsof -ti:${port} | xargs kill 2>/dev/null`, { stdio: "pipe" });
-          }
-          await new Promise(r => setTimeout(r, 500)); // Wait for port to free
-        } catch { /* no process to kill — proceed anyway */ }
-        steps.push("Stale server killed.");
+        const kill = killProcessOnPort(port);
+        if (kill.attemptedPids.length > 0 && kill.killedPids.length === 0) {
+          // Tried to kill, every attempt failed (perms, race, missing binary).
+          // Surface so the agent doesn't loop on the same port forever.
+          return trackResponse("ctx_insight", {
+            content: [{
+              type: "text" as const,
+              text: `Could not free port ${port} (kill failed for ${kill.attemptedPids.join(", ")}: ${kill.errors.join("; ")}). Try ctx_insight({ port: ${port + 1} }) or stop the process manually.`,
+            }],
+          });
+        }
+        if (kill.errors.length > 0 && kill.attemptedPids.length === 0) {
+          // Couldn't even probe the port (e.g. lsof not installed).
+          return trackResponse("ctx_insight", {
+            content: [{
+              type: "text" as const,
+              text: `Cannot reclaim port ${port}: ${kill.errors.join("; ")}. Stop the process manually or pick another port.`,
+            }],
+          });
+        }
+        await new Promise(r => setTimeout(r, 500)); // Wait for port to free
+        steps.push(`Stale server killed (${kill.killedPids.length} pid${kill.killedPids.length === 1 ? "" : "s"}).`);
       } else if (portOccupied) {
         // Source unchanged, server is running fine — just open browser
         steps.push("Dashboard already running.");
         const url = `http://localhost:${port}`;
-        const platform = process.platform;
-        try {
-          if (platform === "darwin") execSync(`open "${url}"`, { stdio: "pipe" });
-          else if (platform === "win32") execSync(`start "" "${url}"`, { stdio: "pipe" });
-          else execSync(`xdg-open "${url}" 2>/dev/null || sensible-browser "${url}" 2>/dev/null`, { stdio: "pipe" });
-        } catch { /* browser open is best-effort */ }
+        const open = openBrowserSync(url);
+        const tail = open.ok
+          ? ""
+          : ` (auto-open failed: ${open.reason}; navigate manually)`;
         return trackResponse("ctx_insight", {
-          content: [{ type: "text" as const, text: `Dashboard already running at http://localhost:${port}` }],
+          content: [{ type: "text" as const, text: `Dashboard already running at ${url}${tail}` }],
         });
       }
 
@@ -3064,14 +3233,10 @@ server.registerTool(
 
       // Open browser (cross-platform)
       const url = `http://localhost:${port}`;
-      const platform = process.platform;
-      try {
-        if (platform === "darwin") execSync(`open "${url}"`, { stdio: "pipe" });
-        else if (platform === "win32") execSync(`start "" "${url}"`, { stdio: "pipe" });
-        else execSync(`xdg-open "${url}" 2>/dev/null || sensible-browser "${url}" 2>/dev/null`, { stdio: "pipe" });
-      } catch { /* browser open is best-effort */ }
+      const open = openBrowserSync(url);
+      const openTail = open.ok ? "" : ` (auto-open failed: ${open.reason}; navigate manually)`;
 
-      steps.push(`Dashboard running at ${url}`);
+      steps.push(`Dashboard running at ${url}${openTail}`);
 
       return trackResponse("ctx_insight", {
         content: [{
