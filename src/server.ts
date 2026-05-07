@@ -126,25 +126,47 @@ let _detectedAdapter: HookAdapter | null = null;
 let _insightChild: ChildProcess | null = null;
 
 /**
+ * Resolve the Claude Code config root, honoring `CLAUDE_CONFIG_DIR` (incl.
+ * leading `~`) before falling back to `~/.claude`. Mirrors
+ * `hooks/session-helpers.mjs::resolveConfigDir` and
+ * `ClaudeCodeAdapter.getConfigDir` so the pre-detection path agrees with
+ * hooks/adapter on where Claude Code session data lives. See issue #453.
+ */
+function resolveClaudeConfigRoot(): string {
+  const envVal = process.env.CLAUDE_CONFIG_DIR;
+  if (envVal) {
+    if (envVal.startsWith("~")) return join(homedir(), envVal.replace(/^~[/\\]?/, ""));
+    return envVal;
+  }
+  return join(homedir(), ".claude");
+}
+
+/**
  * Get the platform-specific sessions directory from the detected adapter.
- * Falls back to ~/.claude/context-mode/sessions/ before adapter detection.
+ * Falls back to <CLAUDE_CONFIG_DIR>/context-mode/sessions/ (or
+ * ~/.claude/context-mode/sessions/) before adapter detection.
  */
 function getSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
   // Pre-detection path (race window before MCP `initialize` completes):
   // call detectPlatform() (sync, env-var-based) and look up segments via
   // getSessionDirSegments() (sync map, no adapter instantiation). This keeps
-  // non-Claude platforms from spilling sessions into ~/.claude/.
+  // non-Claude platforms from spilling sessions into ~/.claude/. For Claude
+  // Code (segments=[".claude"]), reroute through the CLAUDE_CONFIG_DIR
+  // contract so the pre-detection window does not split-state with hooks.
   try {
     const signal = detectPlatform();
     const segments = getSessionDirSegments(signal.platform);
     if (segments) {
-      const dir = join(homedir(), ...segments, "context-mode", "sessions");
+      const root = segments.length === 1 && segments[0] === ".claude"
+        ? resolveClaudeConfigRoot()
+        : join(homedir(), ...segments);
+      const dir = join(root, "context-mode", "sessions");
       mkdirSync(dir, { recursive: true });
       return dir;
     }
-  } catch { /* fall through to .claude fallback */ }
-  const dir = join(homedir(), ".claude", "context-mode", "sessions");
+  } catch { /* fall through to claude fallback */ }
+  const dir = join(resolveClaudeConfigRoot(), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -1659,7 +1681,7 @@ server.registerTool(
         } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
       }
 
-      const configDir = _detectedAdapter?.getConfigDir() ?? (process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"));
+      const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigRoot();
 
       try {
       for (const q of queryList) {

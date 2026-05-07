@@ -187,16 +187,41 @@ describe("ClaudeCodeAdapter", () => {
   // ── Config paths ──────────────────────────────────────
 
   describe("config paths", () => {
-    it("settings path is ~/.claude/settings.json", () => {
+    const savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    beforeEach(() => {
+      delete process.env.CLAUDE_CONFIG_DIR;
+    });
+    afterEach(() => {
+      if (savedConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = savedConfigDir;
+    });
+
+    it("settings path is ~/.claude/settings.json by default", () => {
       expect(adapter.getSettingsPath()).toBe(
         resolve(homedir(), ".claude", "settings.json"),
       );
     });
 
-    it("session dir is under ~/.claude/context-mode/sessions/", () => {
+    it("settings path honors CLAUDE_CONFIG_DIR (issue #453)", () => {
+      process.env.CLAUDE_CONFIG_DIR = join(fakeHome, ".config", "claude-code");
+      expect(adapter.getSettingsPath()).toBe(
+        join(fakeHome, ".config", "claude-code", "settings.json"),
+      );
+    });
+
+    it("session dir is under ~/.claude/context-mode/sessions/ by default", () => {
       const sessionDir = adapter.getSessionDir();
       expect(sessionDir).toBe(
         join(homedir(), ".claude", "context-mode", "sessions"),
+      );
+    });
+
+    it("session dir honors CLAUDE_CONFIG_DIR (issue #453)", () => {
+      const customRoot = join(fakeHome, ".config", "claude-code");
+      process.env.CLAUDE_CONFIG_DIR = customRoot;
+      const sessionDir = adapter.getSessionDir();
+      expect(sessionDir).toBe(
+        join(customRoot, "context-mode", "sessions"),
       );
     });
 
