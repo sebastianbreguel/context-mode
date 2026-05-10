@@ -356,6 +356,44 @@ The regression test at `tests/core/server.test.ts > prose-style policy (#482)` p
 
 If you genuinely need to nudge the model on style for a specific use case, do it in your own project's `CLAUDE.md` / `AGENTS.md`. Don't ship it inside the framework.
 
+## Performance baselines
+
+`tests/perf-baseline.json` records expected p95 latencies per platform (cold-start, executor benches, FTS5 search hot path). PRs run `.github/workflows/bench.yml` on the ubuntu/macos/windows matrix and post a delta table as a PR comment.
+
+The check is reporting-only — it never blocks merge. CI exists to surface regressions early, not to gate small PRs on bench noise.
+
+### Reading the PR comment
+
+```
+🔴 regression   delta exceeds 5% relative OR 50ms / 5µs absolute (whichever is greater)
+🟢 improved     delta below the negative threshold
+🆕 new          metric not yet baselined for this OS/arch
+⚪ ok           within threshold
+```
+
+A platform shows `NEW` for every metric until someone runs `--update` on a representative machine for that platform and commits the result.
+
+### Updating the baseline
+
+Run the full bench locally on a quiet machine, then commit the JSON:
+
+```bash
+npm run bundle                     # cold-start needs server.bundle.mjs
+npm run bench:baseline:update      # writes current platform's metrics
+git add tests/perf-baseline.json
+git commit -m "perf: update baseline for $(node -p 'process.platform + \"-\" + process.arch')"
+```
+
+`--update` overwrites only the entry for `${platform}-${arch}` (e.g. `darwin-arm64`); other platforms are left untouched. Open a separate PR for each platform's baseline ratification — keeps reviewers focused on which numbers actually changed.
+
+### Verifying the regression-check tool
+
+```bash
+npm run bench:baseline:self-test   # exercises threshold logic, no subprocesses, ~50ms
+```
+
+The self-test asserts the threshold floor (5% rel OR 50ms abs / 5µs abs), regression/improved/ok/new classification, and the metric extraction filter. Run it after touching `tests/perf-regression-check.ts`.
+
 ## Submitting a Bug Report
 
 When filing a bug, **always include your prompt**. The exact message you sent to the agent is critical for reproduction. Without it, we can't debug the issue.
