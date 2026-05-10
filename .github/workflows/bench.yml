@@ -140,12 +140,27 @@ jobs:
 
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
-            const list = await github.paginate(github.rest.issues.listComments, {
-              owner, repo, issue_number, per_page: 100,
-            });
-            const existing = list.find((c) => c.body && c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-            } else {
-              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            try {
+              const list = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100,
+              });
+              const existing = list.find((c) => c.body && c.body.includes(marker));
+              if (existing) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number, body });
+              }
+            } catch (err) {
+              // Fork PRs run with a read-only GITHUB_TOKEN (no `pull-requests: write`),
+              // so the upsert returns 403. Bench is reporting-only, never gates merge —
+              // log + step-summary the body and exit clean instead of failing the job.
+              if (err && err.status === 403) {
+                core.warning("Cannot post bench comment (403 — fork PR with read-only token). Body written to step summary.");
+                await core.summary
+                  .addHeading("Bench results (fork-PR fallback)")
+                  .addRaw(body)
+                  .write();
+                return;
+              }
+              throw err;
             }
