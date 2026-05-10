@@ -1,7 +1,10 @@
 import Database from "better-sqlite3";
-import { rmSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { sentinelPathForPid } from "../hooks/core/mcp-ready.mjs";
 import { PolyglotExecutor } from "../src/executor.js";
 import {
   detectRuntimes,
@@ -11,13 +14,19 @@ import {
 } from "../src/runtime.js";
 import { ContentStore } from "../src/store.js";
 
-const runtimes = detectRuntimes();
-const executor = new PolyglotExecutor({ runtimes });
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = resolve(__dirname, "..");
+const START_SCRIPT = resolve(REPO_ROOT, "start.mjs");
+const BASELINE_PATH = resolve(__dirname, "perf-baseline.json");
 
-const JSON_MODE = process.argv.includes("--json");
+const ARGV = process.argv.slice(2);
+const JSON_MODE = ARGV.includes("--json");
 const log = (...args: unknown[]) => {
   if (!JSON_MODE) console.log(...args);
 };
+
+const runtimes = detectRuntimes();
+const executor = new PolyglotExecutor({ runtimes });
 
 interface BenchResult {
   name: string;
@@ -186,7 +195,7 @@ interface ScenarioResult {
   savingsPct: number;
 }
 
-async function main() {
+async function executorMain() {
   log("Context Mode — Performance Benchmarks");
   log("======================================\n");
   log("System:");
@@ -485,11 +494,588 @@ print(f"filtered: {len(filtered)}")
   }
 }
 
-main().catch((err) => {
-  const message = err instanceof Error ? err.message : String(err);
+// ═══ Cold-start mode (--cold-start) ════════════════════════════════════════
+// Spawns N fresh `node start.mjs` processes, polls for MCP-ready sentinel,
+// records elapsed wall-clock per iteration, prints p50/p95/p99 + skip count.
+// Requires `server.bundle.mjs` for representative numbers (run `npm run bundle`).
+
+const COLD_ITERATIONS = Number(process.env.ITERATIONS ?? 10);
+const COLD_WARMUP = Number(process.env.WARMUP ?? 1);
+const COLD_TIMEOUT_MS = Number(process.env.TIMEOUT_MS ?? 30000);
+const COLD_POLL_MS = Number(process.env.POLL_MS ?? 10);
+
+type IterationStatus = "ok" | "timeout" | "spawn-error";
+
+interface IterationResult {
+  status: IterationStatus;
+  elapsedMs: number;
+  stderr: string;
+}
+
+const liveChildren = new Set<ChildProcess>();
+
+function killChild(child: ChildProcess): Promise<void> {
+  return new Promise((resolveKill) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      liveChildren.delete(child);
+      resolveKill();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      liveChildren.delete(child);
+      resolveKill();
+    };
+    child.once("exit", finish);
+    try {
+      child.kill("SIGTERM");
+    } catch {
+      finish();
+      return;
+    }
+    setTimeout(() => {
+      if (done) return;
+      try {
+        child.kill("SIGKILL");
+      } catch { /* best effort */ }
+      setTimeout(finish, 100);
+    }, 500);
+  });
+}
+
+function measureSingleColdStart(): Promise<IterationResult> {
+  return new Promise((resolveResult) => {
+    const child = spawn(process.execPath, [START_SCRIPT], {
+      cwd: REPO_ROOT,
+      stdio: ["ignore", "ignore", "pipe"],
+      env: {
+        ...process.env,
+        CONTEXT_MODE_PROJECT_DIR: REPO_ROOT,
+      },
+    });
+    liveChildren.add(child);
+
+    const start = performance.now();
+    let stderrBuf = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString("utf8");
+      if (stderrBuf.length > 8192) stderrBuf = stderrBuf.slice(-8192);
+    });
+
+    let settled = false;
+    let pollTimer: NodeJS.Timeout | null = null;
+    let timeoutTimer: NodeJS.Timeout | null = null;
+
+    const settle = async (status: IterationStatus, elapsedMs: number) => {
+      if (settled) return;
+      settled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      await killChild(child);
+      resolveResult({ status, elapsedMs, stderr: stderrBuf.trim() });
+    };
+
+    child.once("error", () => {
+      void settle("spawn-error", performance.now() - start);
+    });
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      if (signal === null && code !== 0) {
+        void settle("spawn-error", performance.now() - start);
+      }
+    });
+
+    if (!child.pid) {
+      void settle("spawn-error", 0);
+      return;
+    }
+
+    const sentinelPath = sentinelPathForPid(child.pid);
+
+    pollTimer = setInterval(() => {
+      if (existsSync(sentinelPath)) {
+        const elapsed = performance.now() - start;
+        void settle("ok", elapsed);
+      }
+    }, COLD_POLL_MS);
+
+    timeoutTimer = setTimeout(() => {
+      void settle("timeout", performance.now() - start);
+    }, COLD_TIMEOUT_MS);
+  });
+}
+
+function percentile(sorted: number[], p: number): number {
+  if (sorted.length === 0) return 0;
+  const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * p));
+  return sorted[idx];
+}
+
+function fmtMs(ms: number): string {
+  return ms.toFixed(1);
+}
+
+async function coldStartMain(): Promise<void> {
+  log("Context Mode — Cold-Start Benchmark");
+  log("====================================");
+  log(`Node:        ${process.version}`);
+  log(`Platform:    ${process.platform} (${process.arch})`);
+  log(`Bundle:      ${existsSync(resolve(REPO_ROOT, "server.bundle.mjs")) ? "PRESENT" : "MISSING (will trigger build path)"}`);
+  log(`Iterations:  ${COLD_ITERATIONS} (warmup: ${COLD_WARMUP})`);
+  log(`Timeout:     ${COLD_TIMEOUT_MS}ms per iteration`);
+  log("");
+
+  const sigintHandler = async () => {
+    console.error("\nSIGINT received — killing live children...");
+    await Promise.all(Array.from(liveChildren).map(killChild));
+    process.exit(130);
+  };
+  process.on("SIGINT", sigintHandler);
+
+  if (COLD_WARMUP > 0) {
+    log(`Warming up (${COLD_WARMUP} iteration${COLD_WARMUP === 1 ? "" : "s"}, discarded)...`);
+    for (let i = 0; i < COLD_WARMUP; i++) {
+      const r = await measureSingleColdStart();
+      log(`  warmup ${i + 1}: ${r.status === "ok" ? `${fmtMs(r.elapsedMs)}ms` : `SKIP (${r.status})`}`);
+    }
+    log("");
+  }
+
+  const results: IterationResult[] = [];
+  for (let i = 0; i < COLD_ITERATIONS; i++) {
+    const r = await measureSingleColdStart();
+    results.push(r);
+    if (r.status === "ok") {
+      log(`  iteration ${i + 1}: ${fmtMs(r.elapsedMs)}ms`);
+    } else {
+      const tail = r.stderr ? ` — stderr: ${r.stderr.split("\n").pop()}` : "";
+      log(`  iteration ${i + 1}: SKIP (${r.status})${tail}`);
+    }
+  }
+
+  const okTimes = results
+    .filter((r) => r.status === "ok")
+    .map((r) => r.elapsedMs)
+    .sort((a, b) => a - b);
+  const skipCount = results.length - okTimes.length;
+
+  log("");
+  log("=== Summary ===");
+  if (okTimes.length === 0) {
+    if (JSON_MODE) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            schema: "ctx-coldstart/v1",
+            platform: process.platform,
+            arch: process.arch,
+            node: process.version,
+            iterations: COLD_ITERATIONS,
+            warmup: COLD_WARMUP,
+            timeoutMs: COLD_TIMEOUT_MS,
+            okCount: 0,
+            skipCount,
+            allSkipped: true,
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    } else {
+      log("All iterations skipped — no successful measurements.");
+    }
+    process.off("SIGINT", sigintHandler);
+    process.exit(1);
+  }
+
+  const min = okTimes[0];
+  const max = okTimes[okTimes.length - 1];
+  const p50 = percentile(okTimes, 0.5);
+  const p95 = percentile(okTimes, 0.95);
+  const p99 = percentile(okTimes, 0.99);
+
+  log("| Metric    | Value (ms) |");
+  log("|-----------|------------|");
+  log(`| ok-count  | ${String(okTimes.length).padStart(10)} |`);
+  log(`| skip-count| ${String(skipCount).padStart(10)} |`);
+  log(`| min       | ${fmtMs(min).padStart(10)} |`);
+  log(`| p50       | ${fmtMs(p50).padStart(10)} |`);
+  log(`| p95       | ${fmtMs(p95).padStart(10)} |`);
+  log(`| p99       | ${fmtMs(p99).padStart(10)} |`);
+  log(`| max       | ${fmtMs(max).padStart(10)} |`);
+
+  if (JSON_MODE) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          schema: "ctx-coldstart/v1",
+          platform: process.platform,
+          arch: process.arch,
+          node: process.version,
+          iterations: COLD_ITERATIONS,
+          warmup: COLD_WARMUP,
+          timeoutMs: COLD_TIMEOUT_MS,
+          okCount: okTimes.length,
+          skipCount,
+          minMs: +min.toFixed(1),
+          p50Ms: +p50.toFixed(1),
+          p95Ms: +p95.toFixed(1),
+          p99Ms: +p99.toFixed(1),
+          maxMs: +max.toFixed(1),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+  }
+
+  process.off("SIGINT", sigintHandler);
+}
+
+// ═══ Regression-check mode (--check / --update / --self-test) ══════════════
+// Runs cold-start + executor benches in subprocesses, parses --json output,
+// compares vs tests/perf-baseline.json for current platform, prints delta
+// table or updates baseline. Reporting-only — never gates merge.
+
+type Unit = "ms" | "us";
+interface MetricValue { value: number; unit: Unit }
+interface PlatformBaseline {
+  node?: string;
+  notes?: string;
+  metrics: Record<string, MetricValue>;
+}
+interface Baseline {
+  schemaVersion: string;
+  lastUpdated: string;
+  thresholds: { relPct: number; absFloorMs: number; absFloorUs: number };
+  platforms: Record<string, PlatformBaseline>;
+}
+
+function platformKey(): string {
+  return `${process.platform}-${process.arch}`;
+}
+
+function validateBaseline(b: unknown): asserts b is Baseline {
+  if (!b || typeof b !== "object") throw new Error("baseline: not an object");
+  const x = b as Record<string, unknown>;
+  if (x.schemaVersion !== "ctx-perf-baseline/v1") {
+    throw new Error(`baseline: unsupported schemaVersion ${String(x.schemaVersion)} (expected ctx-perf-baseline/v1)`);
+  }
+  const t = x.thresholds as Record<string, unknown> | undefined;
+  if (!t || typeof t !== "object") throw new Error("baseline: thresholds missing or not object");
+  for (const k of ["relPct", "absFloorMs", "absFloorUs"] as const) {
+    const v = t[k];
+    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) {
+      throw new Error(`baseline: thresholds.${k} must be a positive finite number, got ${String(v)}`);
+    }
+  }
+  if (!x.platforms || typeof x.platforms !== "object") throw new Error("baseline: platforms missing or not object");
+}
+
+function loadBaseline(): Baseline {
+  const raw: unknown = JSON.parse(readFileSync(BASELINE_PATH, "utf8"));
+  validateBaseline(raw);
+  return raw;
+}
+
+const BENCH_TIMEOUT_MS = 600_000; // 10 min ceiling — cold-start can run ~5min on Windows.
+
+function runJsonBench(
+  relPath: string,
+  env: Record<string, string> = {},
+  extraArgs: string[] = [],
+): Record<string, unknown> {
+  const r = spawnSync(
+    process.execPath,
+    ["--import", "tsx", resolve(REPO_ROOT, relPath), ...extraArgs, "--json"],
+    {
+      cwd: REPO_ROOT,
+      env: { ...process.env, ...env },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 16 * 1024 * 1024,
+      timeout: BENCH_TIMEOUT_MS,
+      killSignal: "SIGKILL",
+    },
+  );
+  if (r.signal === "SIGKILL") {
+    throw new Error(`${relPath} ${extraArgs.join(" ")} timed out (>${BENCH_TIMEOUT_MS / 1000}s)\n${r.stderr ?? ""}`);
+  }
+  if (r.status !== 0) {
+    throw new Error(`${relPath} ${extraArgs.join(" ")} failed (exit ${r.status}):\n${r.stderr}`);
+  }
+  return JSON.parse(r.stdout) as Record<string, unknown>;
+}
+
+function extractMetrics(
+  coldStart: Record<string, unknown>,
+  executor: Record<string, unknown>,
+): Record<string, MetricValue> {
+  const out: Record<string, MetricValue> = {};
+
+  if (typeof coldStart.p95Ms === "number") {
+    out["coldStart.p95Ms"] = { value: coldStart.p95Ms, unit: "ms" };
+  }
+
+  const benches = executor.benchmarks as Array<Record<string, unknown>> | undefined;
+  if (Array.isArray(benches)) {
+    for (const b of benches) {
+      if (b.language !== "javascript") continue;
+      const key = `executor.${b.name}/javascript.p95Ms`;
+      if (typeof b.p95Ms === "number") {
+        out[key] = { value: b.p95Ms, unit: "ms" };
+      }
+    }
+  }
+
+  const search = executor.search as Record<string, number> | undefined;
+  if (search && typeof search.fuzzyWarmUs === "number") {
+    out["search.fuzzyWarmUs"] = { value: search.fuzzyWarmUs, unit: "us" };
+  }
+  if (search && typeof search.dedupDedupedUs === "number") {
+    out["search.dedupDedupedUs"] = { value: search.dedupDedupedUs, unit: "us" };
+  }
+
+  return out;
+}
+
+function regressionThreshold(baselineValue: number, unit: Unit, t: Baseline["thresholds"]): number {
+  const floor = unit === "ms" ? t.absFloorMs : t.absFloorUs;
+  return Math.max(baselineValue * t.relPct, floor);
+}
+
+interface DeltaRow {
+  metric: string;
+  unit: Unit;
+  baseline: number | null;
+  current: number;
+  deltaAbs: number | null;
+  deltaPct: number | null;
+  status: "ok" | "regression" | "improved" | "new";
+}
+
+function checkRegressions(
+  baseline: Baseline,
+  platform: string,
+  current: Record<string, MetricValue>,
+): { rows: DeltaRow[]; regressions: DeltaRow[] } {
+  const platformBaseline = baseline.platforms[platform];
+  const rows: DeltaRow[] = [];
+
+  for (const [metric, cur] of Object.entries(current)) {
+    const base = platformBaseline?.metrics[metric];
+    if (!base) {
+      rows.push({
+        metric, unit: cur.unit, baseline: null, current: cur.value,
+        deltaAbs: null, deltaPct: null, status: "new",
+      });
+      continue;
+    }
+    const deltaAbs = cur.value - base.value;
+    const deltaPct = (deltaAbs / base.value) * 100;
+    const threshold = regressionThreshold(base.value, base.unit, baseline.thresholds);
+    let status: DeltaRow["status"] = "ok";
+    if (deltaAbs > threshold) status = "regression";
+    else if (deltaAbs < -threshold) status = "improved";
+    rows.push({
+      metric, unit: cur.unit, baseline: base.value, current: cur.value,
+      deltaAbs, deltaPct, status,
+    });
+  }
+
+  rows.sort((a, b) => a.metric.localeCompare(b.metric));
+  return { rows, regressions: rows.filter((r) => r.status === "regression") };
+}
+
+function fmtUnit(n: number, unit: Unit): string {
+  return unit === "ms" ? `${n.toFixed(1)}ms` : `${n.toFixed(2)}µs`;
+}
+
+const STATUS_ICON: Record<DeltaRow["status"], string> = {
+  ok: "OK  ",
+  regression: "FAIL",
+  improved: "FAST",
+  new: "NEW ",
+};
+
+function printRegressionTable(rows: DeltaRow[]): void {
+  console.log("");
+  console.log(
+    "| Status | Metric                                          | Baseline      | Current       | Δ (abs)       | Δ (%)    |",
+  );
+  console.log(
+    "|--------|-------------------------------------------------|---------------|---------------|---------------|----------|",
+  );
+  for (const r of rows) {
+    const icon = STATUS_ICON[r.status];
+    const baseline = r.baseline === null ? "—" : fmtUnit(r.baseline, r.unit);
+    const current = fmtUnit(r.current, r.unit);
+    const dAbs = r.deltaAbs === null ? "—" : (r.deltaAbs >= 0 ? "+" : "") + fmtUnit(r.deltaAbs, r.unit);
+    const dPct = r.deltaPct === null ? "—" : (r.deltaPct >= 0 ? "+" : "") + r.deltaPct.toFixed(1) + "%";
+    console.log(
+      `| ${icon}   | ${r.metric.padEnd(47)} | ${baseline.padStart(13)} | ${current.padStart(13)} | ${dAbs.padStart(13)} | ${dPct.padStart(8)} |`,
+    );
+  }
+}
+
+function updateBaseline(baseline: Baseline, platform: string, current: Record<string, MetricValue>): Baseline {
+  const next: Baseline = structuredClone(baseline);
+  next.lastUpdated = new Date().toISOString().slice(0, 10);
+  next.platforms[platform] = {
+    ...(next.platforms[platform] ?? {}),
+    node: process.version,
+    metrics: current,
+  };
+  return next;
+}
+
+function regressionSelfTest(): void {
+  const errors: string[] = [];
+  const t = { relPct: 0.05, absFloorMs: 50, absFloorUs: 5 };
+
+  const thresh100ms = regressionThreshold(100, "ms", t);
+  if (thresh100ms !== 50) errors.push(`thresh(100ms) expected 50, got ${thresh100ms}`);
+
+  const thresh2000ms = regressionThreshold(2000, "ms", t);
+  if (thresh2000ms !== 100) errors.push(`thresh(2000ms) expected 100, got ${thresh2000ms}`);
+
+  const thresh50us = regressionThreshold(50, "us", t);
+  if (thresh50us !== 5) errors.push(`thresh(50us) expected 5, got ${thresh50us}`);
+
+  const baseline: Baseline = {
+    schemaVersion: "test", lastUpdated: "2026-01-01", thresholds: t,
+    platforms: { "test-arch": { metrics: {
+      "metric.fast": { value: 100, unit: "ms" },
+      "metric.slow": { value: 2000, unit: "ms" },
+      "metric.us":   { value: 50, unit: "us" },
+    } } },
+  };
+  const current: Record<string, MetricValue> = {
+    "metric.fast": { value: 160, unit: "ms" },
+    "metric.slow": { value: 2050, unit: "ms" },
+    "metric.us":   { value: 44, unit: "us" },
+    "metric.new":  { value: 10, unit: "ms" },
+  };
+  const result = checkRegressions(baseline, "test-arch", current);
+  const byMetric = Object.fromEntries(result.rows.map((r) => [r.metric, r.status]));
+  if (byMetric["metric.fast"] !== "regression") errors.push(`metric.fast expected regression, got ${byMetric["metric.fast"]}`);
+  if (byMetric["metric.slow"] !== "ok") errors.push(`metric.slow expected ok, got ${byMetric["metric.slow"]}`);
+  if (byMetric["metric.us"] !== "improved") errors.push(`metric.us expected improved, got ${byMetric["metric.us"]}`);
+  if (byMetric["metric.new"] !== "new") errors.push(`metric.new expected new, got ${byMetric["metric.new"]}`);
+  if (result.regressions.length !== 1) errors.push(`expected 1 regression, got ${result.regressions.length}`);
+
+  const empty = extractMetrics({}, {});
+  if (Object.keys(empty).length !== 0) errors.push(`extractMetrics({},{}) should be empty`);
+
+  const ext = extractMetrics(
+    { p95Ms: 300 },
+    {
+      benchmarks: [
+        { name: "hello-world", language: "javascript", p95Ms: 50 },
+        { name: "hello-world", language: "python", p95Ms: 80 },
+      ],
+      search: { fuzzyWarmUs: 1.5, dedupDedupedUs: 30 },
+    },
+  );
+  if (!("executor.hello-world/javascript.p95Ms" in ext))
+    errors.push("javascript bench missing from extracted metrics");
+  if ("executor.hello-world/python.p95Ms" in ext)
+    errors.push("python bench should not be in extracted metrics");
+  if (ext["coldStart.p95Ms"]?.value !== 300) errors.push("coldStart.p95Ms not extracted");
+  if (ext["search.fuzzyWarmUs"]?.value !== 1.5) errors.push("search.fuzzyWarmUs not extracted");
+
+  if (errors.length > 0) {
+    console.error("self-test FAILED:");
+    for (const e of errors) console.error("  -", e);
+    process.exit(1);
+  }
+  console.log("self-test PASSED (13 assertions)");
+}
+
+async function regressionMain(): Promise<void> {
+  const wantCheck = ARGV.includes("--check");
+  const wantUpdate = ARGV.includes("--update");
+  if (!wantCheck && !wantUpdate) {
+    console.error("usage: benchmark.ts [--check | --update | --self-test] [--json]");
+    process.exit(2);
+  }
+
+  if (!existsSync(BASELINE_PATH)) {
+    console.error(`baseline file missing: ${BASELINE_PATH}`);
+    process.exit(2);
+  }
+
+  const baseline = loadBaseline();
+  const platform = platformKey();
+
+  console.error(`[perf-check] platform=${platform} node=${process.version}`);
+  console.error("[perf-check] running cold-start bench...");
+  const coldStart = runJsonBench(
+    "tests/benchmark.ts",
+    {
+      ITERATIONS: process.env.PERF_COLDSTART_ITER ?? "10",
+      WARMUP: process.env.PERF_COLDSTART_WARMUP ?? "1",
+    },
+    ["--cold-start"],
+  );
+  console.error("[perf-check] running executor bench...");
+  const executorOut = runJsonBench("tests/benchmark.ts");
+
+  const current = extractMetrics(coldStart, executorOut);
+
+  if (wantUpdate) {
+    const next = updateBaseline(baseline, platform, current);
+    const tmp = BASELINE_PATH + ".tmp";
+    writeFileSync(tmp, JSON.stringify(next, null, 2) + "\n");
+    renameSync(tmp, BASELINE_PATH);
+    console.error(`[perf-check] baseline updated for ${platform} (${Object.keys(current).length} metrics)`);
+    return;
+  }
+
+  const { rows, regressions } = checkRegressions(baseline, platform, current);
   if (JSON_MODE) {
     process.stdout.write(JSON.stringify({
-      schema: "ctx-bench/v1",
+      schema: "ctx-perf-check/v1",
+      platform, node: process.version,
+      baselinePresent: platform in baseline.platforms,
+      regressionCount: regressions.length,
+      newCount: rows.filter((r) => r.status === "new").length,
+      rows,
+    }, null, 2) + "\n");
+  } else {
+    if (!(platform in baseline.platforms)) {
+      console.log(`[perf-check] no baseline yet for ${platform} — all metrics will show NEW`);
+    }
+    printRegressionTable(rows);
+    console.log("");
+    if (regressions.length > 0) {
+      console.log(`${regressions.length} regression(s) detected (informational; CI does not fail).`);
+    } else {
+      console.log("No regressions vs baseline.");
+    }
+  }
+}
+
+// ═══ Dispatcher ══════════════════════════════════════════════════════════════
+
+const dispatch = async (): Promise<void> => {
+  if (ARGV.includes("--self-test")) { regressionSelfTest(); return; }
+  if (ARGV.includes("--cold-start")) return coldStartMain();
+  if (ARGV.includes("--check") || ARGV.includes("--update")) return regressionMain();
+  return executorMain();
+};
+
+dispatch().catch(async (err) => {
+  await Promise.all(Array.from(liveChildren).map(killChild));
+  const message = err instanceof Error ? err.message : String(err);
+  let schema: "ctx-bench/v1" | "ctx-coldstart/v1" | "ctx-perf-check/v1" = "ctx-bench/v1";
+  if (ARGV.includes("--cold-start")) schema = "ctx-coldstart/v1";
+  else if (ARGV.includes("--check") || ARGV.includes("--update") || ARGV.includes("--self-test")) schema = "ctx-perf-check/v1";
+  if (JSON_MODE) {
+    process.stdout.write(JSON.stringify({
+      schema,
       ok: false,
       errorKind: "unknown",
       message,
