@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "ctx-perf-baseline/v1",
+  "lastUpdated": "2026-05-10",
+  "thresholds": {
+    "relPct": 0.05,
+    "absFloorMs": 50,
+    "absFloorUs": 5
+  },
+  "platforms": {
+    "darwin-arm64": {
+      "node": "v25.9.0",
+      "notes": "Initial seed: cold-start p95 from PR #357 measurement (10 iter, server.bundle.mjs prebuilt). Other metrics fill on first --update.",
+      "metrics": {
+        "coldStart.p95Ms": {
+          "value": 349.0,
+          "unit": "ms"
+        }
+      }
+    }
+  }
+}
