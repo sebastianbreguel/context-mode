@@ -386,9 +386,11 @@ describe("Cross-Language Cap", () => {
 
   test.runIf(runtimes.python)("python: cap works with python scripts", async () => {
     const executor = new PolyglotExecutor({ hardCapBytes: 2048, runtimes });
+    // Single large write (not a 10k-iter loop): keeps the test fast on slow
+    // Windows CI VMs where per-syscall Python overhead can otherwise blow the timeout.
     const r = await executor.execute({
       language: "python",
-      code: 'import sys\nfor i in range(10000):\n    sys.stdout.write("x" * 50 + "\\n")',
+      code: 'import sys\nsys.stdout.write("x" * 100000)',
       timeout: 10_000,
     });
     assert.ok(r.stderr.includes("output capped"), "Cap should trigger for python output");

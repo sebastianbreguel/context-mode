@@ -125,8 +125,13 @@ describe("Issue #531 — asymmetric-drift invariant", () => {
       cwd: ROOT,
       encoding: "utf-8",
       timeout: 30_000,
+      // npm on Windows is npm.cmd; spawnSync can't resolve .cmd without a shell.
+      shell: process.platform === "win32",
     });
-    expect(r.status, `npm pack failed: stderr=${r.stderr} stdout=${r.stdout}`).toBe(0);
+    expect(
+      r.status,
+      `npm pack failed: error=${r.error?.message ?? "none"} stderr=${r.stderr} stdout=${r.stdout}`,
+    ).toBe(0);
     const pack = JSON.parse(r.stdout) as Array<{ files: Array<{ path: string }> }>;
     const files = new Set(pack[0]?.files?.map((f) => f.path) ?? []);
     expect(files).toContain(".claude-plugin/plugin.json");
