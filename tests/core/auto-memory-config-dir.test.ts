@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { searchAutoMemory } from "../../src/search/auto-memory.js";
+import { hashProjectDirCanonical } from "../../src/session/db.js";
 
 /**
  * Issue #460 round-3: when called WITHOUT an adapter or explicit configDir,
@@ -30,9 +31,11 @@ describe("searchAutoMemory CLAUDE_CONFIG_DIR fallback (#460 round-3)", () => {
     else process.env.CLAUDE_CONFIG_DIR = saved;
   });
 
-  it("legacy fallback reads <CLAUDE_CONFIG_DIR>/memory when env is set", () => {
-    // Write a marker memory file under the relocated config dir.
-    const memDir = join(customCfg, "memory");
+  it("legacy fallback reads <CLAUDE_CONFIG_DIR>/memory/<projectHash> when env is set", () => {
+    // Issue #663: the adapterless fallback now scopes by projectDir hash
+    // so two projects can't share a memory dir. CLAUDE_CONFIG_DIR routing
+    // is still honored — the hash suffix lives underneath the env root.
+    const memDir = join(customCfg, "memory", hashProjectDirCanonical(projectDir));
     mkdirSync(memDir, { recursive: true });
     writeFileSync(
       join(memDir, "decisions.md"),
@@ -45,6 +48,23 @@ describe("searchAutoMemory CLAUDE_CONFIG_DIR fallback (#460 round-3)", () => {
 
     const flat = results.map((r) => r.content).join("\n");
     expect(flat).toContain("ROUTE-460-MARKER");
+  });
+
+  it("legacy fallback no longer reads the unscoped <CLAUDE_CONFIG_DIR>/memory path (#663)", () => {
+    // Pin the new contract: memory written to the OLD unscoped path is
+    // no longer surfaced. This is the leak the fix closes.
+    const oldUnscopedDir = join(customCfg, "memory");
+    mkdirSync(oldUnscopedDir, { recursive: true });
+    writeFileSync(
+      join(oldUnscopedDir, "decisions.md"),
+      "# Decisions\n- UNSCOPED-LEAK-CANARY: must not surface post-#663.\n",
+      "utf-8",
+    );
+    process.env.CLAUDE_CONFIG_DIR = customCfg;
+
+    const results = searchAutoMemory(["UNSCOPED-LEAK-CANARY"], 5, projectDir);
+
+    expect(results).toEqual([]);
   });
 
   it("legacy fallback ignores empty/whitespace env (uses ~/.claude floor)", () => {

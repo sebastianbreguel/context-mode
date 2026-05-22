@@ -38,6 +38,7 @@
 import { join, resolve } from "node:path";
 import { accessSync, copyFileSync, constants, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { hashProjectDirCanonical } from "../session/db.js";
 
 /**
  * Universal storage-root override. Returns the resolved absolute path when
@@ -102,18 +103,26 @@ export abstract class BaseAdapter {
   }
 
   /**
-   * Default: <configDir>/memory. Always absolute (configDir is absolute by
-   * contract). Adapters with a different memory dir name (e.g., codex uses
-   * "memories" plural) override this.
+   * Default: <configDir>/memory/<projectHash>. Always absolute (configDir is
+   * absolute by contract). Adapters with a different memory dir name (e.g.,
+   * codex uses "memories" plural) override this.
    *
    * Issue #649: when `CONTEXT_MODE_DATA_DIR` is set, memory follows storage
    * to `<DATA_DIR>/context-mode/memory/` since persistent memory is
    * context-mode-owned state, not platform-native config.
+   *
+   * Issue #663: when `projectDir` is supplied the path is scoped via
+   * `hashProjectDirCanonical(projectDir)` so two projects running in
+   * parallel never share auto-memory contents. When omitted (legacy
+   * callers), the unscoped path is returned for backwards compatibility.
    */
-  getMemoryDir(): string {
+  getMemoryDir(projectDir?: string): string {
     const override = resolveContextModeDataRoot();
-    if (override) return join(override, "context-mode", "memory");
-    return join(this.getConfigDir(), "memory");
+    const base = override
+      ? join(override, "context-mode", "memory")
+      : join(this.getConfigDir(), "memory");
+    if (!projectDir) return base;
+    return join(base, hashProjectDirCanonical(projectDir));
   }
 
   backupSettings(): string | null {

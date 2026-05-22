@@ -26,6 +26,7 @@ import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
+import { hashProjectDirCanonical } from "../../session/db.js";
 import { resolveCodexConfigDir } from "./paths.js";
 
 import {
@@ -348,15 +349,20 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
     return ["AGENTS.md", "AGENTS.override.md"];
   }
 
-  getMemoryDir(): string {
+  getMemoryDir(projectDir?: string): string {
     // Codex uses "memories" (plural), not the default "memory".
     // Issue #649: honor CONTEXT_MODE_DATA_DIR for context-mode-owned
     // persistent memory while preserving the platform-native plural folder
     // name so legacy Codex tooling continues to find it when DATA_DIR is
     // unset. Under the override, layout is `<DATA_DIR>/context-mode/memories`.
+    // Issue #663: scope by projectDir hash so parallel projects can't
+    // read each other's memory.
     const override = resolveContextModeDataRoot();
-    if (override) return join(override, "context-mode", "memories");
-    return join(this.getConfigDir(), "memories");
+    const base = override
+      ? join(override, "context-mode", "memories")
+      : join(this.getConfigDir(), "memories");
+    if (!projectDir) return base;
+    return join(base, hashProjectDirCanonical(projectDir));
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {

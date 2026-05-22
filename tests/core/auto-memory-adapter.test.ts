@@ -132,3 +132,113 @@ describe("searchAutoMemory adapter dispatch", () => {
     expect(results[0].source).toContain("GEMINI.md");
   });
 });
+
+// Issue #663 — searchAutoMemory must NOT cross project boundaries.
+//
+// Before this fix, two terminals open in different repos shared the same
+// `<configDir>/memory` directory; auto-memory from project-A leaked into
+// `ctx_search` results inside project-B sessions. The fix routes the path
+// through `adapter.getMemoryDir(projectDir)`, which scopes via
+// `hashProjectDirCanonical(projectDir)`.
+//
+// This test pins the contract at the integration boundary: write a marker
+// into project-A's scoped memory dir, search from project-B, expect zero
+// hits. If the leak ever regresses, this test fails immediately.
+describe("searchAutoMemory project isolation (#663)", () => {
+  let projectA: string;
+  let projectB: string;
+  let configDirForA: string;
+  let configDirForB: string;
+
+  beforeEach(() => {
+    projectA = mkdtempSync(join(tmpdir(), "ctxam-projA-"));
+    projectB = mkdtempSync(join(tmpdir(), "ctxam-projB-"));
+    configDirForA = mkdtempSync(join(tmpdir(), "ctxam-cfgA-"));
+    configDirForB = mkdtempSync(join(tmpdir(), "ctxam-cfgB-"));
+  });
+
+  afterEach(() => {
+    for (const d of [projectA, projectB, configDirForA, configDirForB]) {
+      rmSync(d, { recursive: true, force: true });
+    }
+  });
+
+  it("memory written in projectA does not appear in projectB results when the adapter scopes by projectDir", async () => {
+    const { hashProjectDirCanonical } = await import("../../src/session/db.js");
+
+    // Adapter that mimics shared-configDir layout: both projects point at
+    // the SAME configDir base, but the project hash should separate them.
+    const sharedConfigDir = configDirForA;
+    const adapter = new CodexAdapter();
+    (adapter as unknown as { getConfigDir(): string }).getConfigDir = () => sharedConfigDir;
+    (adapter as unknown as { getInstructionFiles(): string[] }).getInstructionFiles = () => ["AGENTS.md"];
+    // Spy on the projectDir-aware override — delegate to a hash-scoped layout
+    // so we exercise the same routing real adapters use post-#663.
+    (adapter as unknown as { getMemoryDir(p?: string): string }).getMemoryDir =
+      (p?: string) =>
+        p
+          ? join(sharedConfigDir, "memories", hashProjectDirCanonical(p))
+          : join(sharedConfigDir, "memories");
+
+    // Write a project-A-only marker into project-A's scoped memory dir.
+    const projectAMemoryDir = join(
+      sharedConfigDir,
+      "memories",
+      hashProjectDirCanonical(projectA),
+    );
+    mkdirSync(projectAMemoryDir, { recursive: true });
+    writeFileSync(
+      join(projectAMemoryDir, "secret.md"),
+      "PROJECT-A-LEAK-CANARY should never be visible from project B.\n",
+      "utf-8",
+    );
+
+    // Run searchAutoMemory from project-B's perspective.
+    const results = searchAutoMemory(
+      ["PROJECT-A-LEAK-CANARY"],
+      5,
+      projectB,
+      undefined,
+      adapter,
+    );
+
+    expect(results.length).toBe(0);
+  });
+
+  it("memory in projectA is still visible to projectA itself (positive control)", async () => {
+    const { hashProjectDirCanonical } = await import("../../src/session/db.js");
+
+    const sharedConfigDir = configDirForA;
+    const adapter = new CodexAdapter();
+    (adapter as unknown as { getConfigDir(): string }).getConfigDir = () => sharedConfigDir;
+    (adapter as unknown as { getInstructionFiles(): string[] }).getInstructionFiles = () => ["AGENTS.md"];
+    (adapter as unknown as { getMemoryDir(p?: string): string }).getMemoryDir =
+      (p?: string) =>
+        p
+          ? join(sharedConfigDir, "memories", hashProjectDirCanonical(p))
+          : join(sharedConfigDir, "memories");
+
+    const projectAMemoryDir = join(
+      sharedConfigDir,
+      "memories",
+      hashProjectDirCanonical(projectA),
+    );
+    mkdirSync(projectAMemoryDir, { recursive: true });
+    writeFileSync(
+      join(projectAMemoryDir, "notes.md"),
+      "PROJECT-A-POSITIVE-MARKER must be findable from project A.\n",
+      "utf-8",
+    );
+
+    const results = searchAutoMemory(
+      ["PROJECT-A-POSITIVE-MARKER"],
+      5,
+      projectA,
+      undefined,
+      adapter,
+    );
+
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].source).toContain("notes.md");
+  });
+});

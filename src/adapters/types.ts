@@ -254,8 +254,14 @@ export interface HookAdapter {
    * Directory where persistent per-user memory is stored
    * (e.g., ~/.claude/memory, ~/.codex/memories). Auto-memory scans
    * *.md files in this directory.
+   *
+   * When `projectDir` is supplied, the path MUST be project-scoped (issue
+   * #663) so two projects running in parallel cannot read each other's
+   * memory. Adapters scope via `hashProjectDirCanonical(projectDir)`.
+   * Callers that pre-date this contract may omit `projectDir`; in that
+   * case the unscoped legacy path is returned.
    */
-  getMemoryDir(): string;
+  getMemoryDir(projectDir?: string): string;
 
   /** Generate hook registration config for this platform. */
   generateHookConfig(pluginRoot: string): HookRegistration;

@@ -219,9 +219,18 @@ export class OpenClawAdapter extends BaseAdapter implements HookAdapter {
     return ["AGENTS.md"];
   }
 
-  /** Absolute <projectRoot>/memory directory. */
-  getMemoryDir(): string {
-    return join(this.getConfigDir(), "memory");
+  /**
+   * Absolute <projectRoot>/memory directory.
+   *
+   * OpenClaw's `getConfigDir(projectDir)` already returns the project root,
+   * so the memory dir is naturally project-scoped per the OpenClaw
+   * convention. The `projectDir` parameter is honored for explicit
+   * resolution; without it, falls back to the implicit `process.cwd()`
+   * inside `getConfigDir`. Either way, two projects never share a path
+   * — no hash suffix needed (issue #663).
+   */
+  getMemoryDir(projectDir?: string): string {
+    return join(this.getConfigDir(projectDir), "memory");
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {

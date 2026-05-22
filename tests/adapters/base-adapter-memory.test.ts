@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, it, expect } from "vitest";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { BaseAdapter } from "../../src/adapters/base.js";
+import { hashProjectDirCanonical } from "../../src/session/db.js";
 
 /**
  * BaseAdapter memory/config dispatch defaults.
@@ -152,5 +153,79 @@ describe("BaseAdapter — adapter-storage interface narrowing (C2)", () => {
   it("does NOT expose getSessionEventsPath — events.md path lives in callers/server", () => {
     const adapter = new TestAdapter([".claude"]);
     expect((adapter as unknown as Record<string, unknown>).getSessionEventsPath).toBeUndefined();
+  });
+});
+
+// Issue #663 — auto-memory leaks across projects.
+//
+// Before this fix, `getMemoryDir()` ignored `projectDir` and every adapter
+// (except OpenClaw, whose configDir is the project root) returned a path
+// shared by every project on the machine. Two terminals open in different
+// repos read each other's memory files via searchAutoMemory().
+//
+// Contract for the scoped form:
+//   - `getMemoryDir(projectDir)`                → `<base>/<hashProjectDirCanonical(projectDir)>`
+//   - `getMemoryDir()` (legacy, no projectDir)  → `<base>` (unscoped) for backwards compat
+//   - Two distinct projectDirs                  → two distinct paths
+//   - Same projectDir on repeat calls           → identical path (deterministic)
+//
+// `CONTEXT_MODE_DATA_DIR` continues to relocate the root; the hash suffix
+// sits underneath whichever root is active.
+describe("BaseAdapter — getMemoryDir project scoping (#663)", () => {
+  const ENV_KEY = "CONTEXT_MODE_DATA_DIR";
+  let original: string | undefined;
+
+  beforeEach(() => {
+    original = process.env[ENV_KEY];
+    delete process.env[ENV_KEY];
+  });
+
+  afterEach(() => {
+    if (original === undefined) delete process.env[ENV_KEY];
+    else process.env[ENV_KEY] = original;
+  });
+
+  it("getMemoryDir(projectDir) appends hashProjectDirCanonical(projectDir)", () => {
+    const adapter = new TestAdapter([".claude"]);
+    const projectDir = "/Users/test/projects/alpha";
+    const expected = join(
+      homedir(),
+      ".claude",
+      "memory",
+      hashProjectDirCanonical(projectDir),
+    );
+    expect(adapter.getMemoryDir(projectDir)).toBe(expected);
+  });
+
+  it("two different projectDirs yield two different paths", () => {
+    const adapter = new TestAdapter([".claude"]);
+    const a = adapter.getMemoryDir("/Users/test/projects/alpha");
+    const b = adapter.getMemoryDir("/Users/test/projects/beta");
+    expect(a).not.toBe(b);
+  });
+
+  it("same projectDir is deterministic across calls", () => {
+    const adapter = new TestAdapter([".claude"]);
+    const p = "/Users/test/projects/gamma";
+    expect(adapter.getMemoryDir(p)).toBe(adapter.getMemoryDir(p));
+  });
+
+  it("getMemoryDir() without projectDir returns the legacy unscoped path (backwards compat)", () => {
+    const adapter = new TestAdapter([".claude"]);
+    expect(adapter.getMemoryDir()).toBe(join(homedir(), ".claude", "memory"));
+  });
+
+  it("hash suffix lives under CONTEXT_MODE_DATA_DIR root when env is set", () => {
+    const adapter = new TestAdapter([".pi"]);
+    process.env[ENV_KEY] = "/tmp/custom-data";
+    const projectDir = "/Users/test/projects/delta";
+    expect(adapter.getMemoryDir(projectDir)).toBe(
+      join(
+        resolve("/tmp/custom-data"),
+        "context-mode",
+        "memory",
+        hashProjectDirCanonical(projectDir),
+      ),
+    );
   });
 });
