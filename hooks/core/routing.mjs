@@ -608,13 +608,20 @@ function getPlatformSettingsPath(platform) {
 // Patterns may be exact ("Explore") or end-glob ("plugin-namespace:*").
 // Conservative default: missing / unknown / "general-purpose" subagent_type
 // is NOT skipped — those agents may use ctx_* tools.
+//
+// VERIFICATION RULE — any entry added here must be backed by either:
+//   (a) Claude Code built-in documentation showing the agent has no MCP surface
+//   (b) the plugin's agent frontmatter declaring an explicit `tools:` whitelist
+//       with no `ctx_*` or `mcp__*` entries.
+// Agents WITHOUT a `tools:` field inherit ALL parent tools (including ctx_*)
+// — do NOT add those here; the block is not dead text for them.
 const SKIP_ROUTING_BLOCK_AGENTS = new Set([
-  // Claude Code built-ins: read-only / planning, no MCP surface.
+  // Claude Code built-ins — read-only / planning, no MCP surface.
   "Explore",
   "Plan",
-  // Plugin-namespaced agents reported as MCP-less in #641.
+  // Plugin agents with explicit MCP-less `tools:` whitelists (verified
+  // against each plugin's agents/*.md frontmatter).
   "caveman:*",
-  "pr-review-toolkit:*",
   "feature-dev:*",
 ]);
 
