@@ -53,7 +53,7 @@ GitHub API rate-limit: cap at 4 for `gh` calls.
 
 ## Subagent routing
 
-Routing block auto-injected into subagent prompts. Bash-type subagents upgraded to general-purpose. No manual instruction needed.
+Routing block auto-injected into subagent prompts UNLESS the `subagent_type` matches the baked skip-list of agents known to lack `ctx_*` MCP tools (`Explore`, `Plan`, plugin-namespaced wildcards). Override via `CTX_ROUTING_SKIP_AGENTS=foo,-Plan,bar:*` (#641). Bash-type subagents upgraded to general-purpose regardless of skip. No manual instruction needed.
 
 ## Output
 

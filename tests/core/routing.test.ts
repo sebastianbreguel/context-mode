@@ -85,6 +85,174 @@ describe("Routing: Subagents (Agent only — Task removed per #241)", () => {
   });
 });
 
+describe("Agent routing-block skip filter (#641)", () => {
+  // Isolate the env override across cases — leaking the var would corrupt
+  // every later test that depends on the baked skip-list.
+  beforeEach(() => {
+    delete process.env.CTX_ROUTING_SKIP_AGENTS;
+  });
+
+  it("Explore (baked) is skipped — passthrough, no block injected", () => {
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "find x", subagent_type: "Explore" },
+      "/test",
+    );
+    expect(decision).toBeNull();
+  });
+
+  it("Plan (baked) is skipped — passthrough", () => {
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "design y", subagent_type: "Plan" },
+      "/test",
+    );
+    expect(decision).toBeNull();
+  });
+
+  it("general-purpose still receives the block (conservative default)", () => {
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "do z", subagent_type: "general-purpose" },
+      "/test",
+    );
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("do z" + SUBAGENT_BLOCK);
+  });
+
+  it("unknown subagent_type still receives the block (conservative default)", () => {
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "go", subagent_type: "some-custom-researcher" },
+      "/test",
+    );
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("go" + SUBAGENT_BLOCK);
+  });
+
+  it("missing subagent_type still receives the block (conservative default)", () => {
+    const decision = routePreToolUse("Agent", { prompt: "go" }, "/test");
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("go" + SUBAGENT_BLOCK);
+  });
+
+  it("Bash conversion preserved when block is NOT skipped — block + rewrite", () => {
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "ls", subagent_type: "Bash" },
+      "/test",
+    );
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("ls" + SUBAGENT_BLOCK);
+    expect(decision!.updatedInput.subagent_type).toBe("general-purpose");
+  });
+
+  it("Bash conversion preserved when block IS skipped via env — rewrite still fires", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = "Bash";
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "ls", subagent_type: "Bash" },
+      "/test",
+    );
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("ls"); // no block appended
+    expect(decision!.updatedInput.subagent_type).toBe("general-purpose");
+  });
+
+  it("env ADD: arbitrary agent name becomes skipped", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = "my-custom-agent";
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "go", subagent_type: "my-custom-agent" },
+      "/test",
+    );
+    expect(decision).toBeNull();
+  });
+
+  it("env REMOVE: baked entry opts back in to receiving the block", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = "-Explore";
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "find x", subagent_type: "Explore" },
+      "/test",
+    );
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("find x" + SUBAGENT_BLOCK);
+  });
+
+  it("env MIXED: add + remove tokens compose", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = "foo,-Explore,bar";
+    // foo skipped
+    expect(
+      routePreToolUse("Agent", { prompt: "p", subagent_type: "foo" }, "/test"),
+    ).toBeNull();
+    // bar skipped
+    expect(
+      routePreToolUse("Agent", { prompt: "p", subagent_type: "bar" }, "/test"),
+    ).toBeNull();
+    // Explore opted back in
+    const d = routePreToolUse(
+      "Agent",
+      { prompt: "p", subagent_type: "Explore" },
+      "/test",
+    );
+    expect(d!.action).toBe("modify");
+    expect(d!.updatedInput.prompt).toBe("p" + SUBAGENT_BLOCK);
+  });
+
+  it("wildcard pattern: caveman:* matches caveman:cavecrew-builder", () => {
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "p", subagent_type: "caveman:cavecrew-builder" },
+      "/test",
+    );
+    expect(decision).toBeNull();
+  });
+
+  it("empty env: baked list applies unchanged", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = "";
+    expect(
+      routePreToolUse("Agent", { prompt: "p", subagent_type: "Explore" }, "/test"),
+    ).toBeNull();
+    expect(
+      routePreToolUse("Agent", { prompt: "p", subagent_type: "Plan" }, "/test"),
+    ).toBeNull();
+  });
+
+  it("env REMOVE with wildcard pattern: -caveman:builder excludes that exact name even though caveman:* is baked", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = "-caveman:builder";
+    const decision = routePreToolUse(
+      "Agent",
+      { prompt: "p", subagent_type: "caveman:builder" },
+      "/test",
+    );
+    expect(decision!.action).toBe("modify");
+    expect(decision!.updatedInput.prompt).toBe("p" + SUBAGENT_BLOCK);
+    // Other caveman: agents still match the baked wildcard
+    expect(
+      routePreToolUse("Agent", { prompt: "p", subagent_type: "caveman:other" }, "/test"),
+    ).toBeNull();
+  });
+
+  it("skip path honors alternate prompt field discovery (request, query, etc.)", () => {
+    // Skip = null → no mutation, so the test is that the passthrough fires for
+    // any field shape, not just `prompt`.
+    expect(
+      routePreToolUse("Agent", { request: "p", subagent_type: "Explore" }, "/test"),
+    ).toBeNull();
+    expect(
+      routePreToolUse("Agent", { query: "p", subagent_type: "Plan" }, "/test"),
+    ).toBeNull();
+  });
+
+  it("malformed env value (only commas / whitespace) is ignored — baked list intact", () => {
+    process.env.CTX_ROUTING_SKIP_AGENTS = " , , ,";
+    expect(
+      routePreToolUse("Agent", { prompt: "p", subagent_type: "Explore" }, "/test"),
+    ).toBeNull();
+  });
+});
+
 describe("Bash structurally-bounded allowlist (#463)", () => {
   // Each test resets the guidance throttle so the per-session marker doesn't
   // bleed across tests. The throttle is global to the routing module — without

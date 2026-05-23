@@ -594,6 +594,69 @@ function getPlatformSettingsPath(platform) {
   return undefined;
 }
 
+// ─── Routing-block skip filter (#641) ───────────────────────────────────
+// Default-on: skip routing-block injection for subagents whose subagent_type
+// is known to lack ctx_* MCP tools. Eliminates ~580 tokens of inert XML per
+// spawn for the ~70% of agents with no ctx_* surface.
+//
+// Override via CTX_ROUTING_SKIP_AGENTS env var (comma-separated tokens):
+//   "a,b,c"   → ADD a, b, c to the baked skip-list
+//   "-a,-b"   → REMOVE a, b from the baked skip-list (opt-back-in)
+//   "+a,-b"   → mixed
+//   "" / unset → use baked list unchanged
+//
+// Patterns may be exact ("Explore") or end-glob ("plugin-namespace:*").
+// Conservative default: missing / unknown / "general-purpose" subagent_type
+// is NOT skipped — those agents may use ctx_* tools.
+const SKIP_ROUTING_BLOCK_AGENTS = new Set([
+  // Claude Code built-ins: read-only / planning, no MCP surface.
+  "Explore",
+  "Plan",
+  // Plugin-namespaced agents reported as MCP-less in #641.
+  "caveman:*",
+  "pr-review-toolkit:*",
+  "feature-dev:*",
+]);
+
+function matchesAgentName(name, pattern) {
+  if (pattern.endsWith(":*")) {
+    // End-glob: "ns:*" matches anything starting with "ns:".
+    return name.startsWith(pattern.slice(0, -1));
+  }
+  return name === pattern;
+}
+
+function parseSkipAgentsEnv(value) {
+  const add = new Set();
+  const remove = new Set();
+  if (!value) return { add, remove };
+  for (const raw of String(value).split(",")) {
+    const tok = raw.trim();
+    if (!tok) continue;
+    if (tok.startsWith("-")) remove.add(tok.slice(1));
+    else if (tok.startsWith("+")) add.add(tok.slice(1));
+    else add.add(tok);
+  }
+  return { add, remove };
+}
+
+function shouldSkipRoutingBlock(subagentType, envValue = process.env.CTX_ROUTING_SKIP_AGENTS) {
+  if (!subagentType) return false;
+  const { add, remove } = parseSkipAgentsEnv(envValue);
+  // Explicit opt-back-in wins: if the name matches any remove pattern,
+  // do not skip — even if it would otherwise match a baked wildcard.
+  for (const pattern of remove) {
+    if (matchesAgentName(subagentType, pattern)) return false;
+  }
+  for (const pattern of SKIP_ROUTING_BLOCK_AGENTS) {
+    if (matchesAgentName(subagentType, pattern)) return true;
+  }
+  for (const pattern of add) {
+    if (matchesAgentName(subagentType, pattern)) return true;
+  }
+  return false;
+}
+
 /**
  * Route a PreToolUse event. Returns normalized decision object or null for passthrough.
  *
@@ -815,21 +878,34 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   }
 
   // ─── Agent: inject context-mode routing into subagent prompts ───
-  // Subagents cannot use ctx commands (stats/doctor/upgrade/purge) — omit that section (#233)
+  // Subagents cannot use ctx commands (stats/doctor/upgrade/purge) — omit that section (#233).
+  // Skip injection entirely for agents known to lack ctx_* tools (#641):
+  // ~580-token inert XML per spawn for the majority case. Bash → general-purpose
+  // rewrite is orthogonal and always fires.
   if (canonical === "Agent") {
     const subagentType = toolInput.subagent_type ?? "";
     // Detect the correct field name for the prompt/request/objective/question/query
     const fieldName = ["prompt", "request", "objective", "question", "query", "task"].find(f => f in toolInput) ?? "prompt";
     const prompt = toolInput[fieldName] ?? "";
 
-    const subagentBlock = createRoutingBlock(t, { includeCommands: false });
+    const skip = shouldSkipRoutingBlock(subagentType);
+    const subagentBlock = skip ? "" : createRoutingBlock(t, { includeCommands: false });
 
-    const updatedInput =
-      subagentType === "Bash"
-        ? { ...toolInput, [fieldName]: prompt + subagentBlock, subagent_type: "general-purpose" }
-        : { ...toolInput, [fieldName]: prompt + subagentBlock };
+    // Bash branch: rewrite subagent_type even when block is skipped.
+    if (subagentType === "Bash") {
+      return {
+        action: "modify",
+        updatedInput: { ...toolInput, [fieldName]: prompt + subagentBlock, subagent_type: "general-purpose" },
+      };
+    }
 
-    return { action: "modify", updatedInput };
+    // Skip + non-Bash: passthrough (no mutation needed).
+    if (skip) return null;
+
+    return {
+      action: "modify",
+      updatedInput: { ...toolInput, [fieldName]: prompt + subagentBlock },
+    };
   }
 
   // ─── MCP execute: security check for shell commands ───
