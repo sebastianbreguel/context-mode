@@ -58,7 +58,13 @@ async function registerOmpPlugin(
   opts?: { projectDir?: string },
 ) {
   const projectDir = opts?.projectDir ?? tempDir;
+  // OMP_PROJECT_DIR is read by some legacy tests but the production
+  // plugin (src/adapters/omp/plugin.ts) actually resolves through
+  // PI_PROJECT_DIR — upstream Oh-My-Pi only sets PI_-prefixed env
+  // vars. Set BOTH so tests stay forward-compatible if the resolution
+  // contract ever broadens.
   process.env.OMP_PROJECT_DIR = projectDir;
+  process.env.PI_PROJECT_DIR = projectDir;
   // Reset module-level singletons so each test sees a fresh DB
   const mod = await import("../../src/adapters/omp/plugin.js");
   mod._resetOmpPluginStateForTests();
@@ -80,6 +86,7 @@ describe("OMP plugin", () => {
       /* best effort */
     }
     delete process.env.OMP_PROJECT_DIR;
+    delete process.env.PI_PROJECT_DIR;
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -187,11 +194,17 @@ describe("OMP plugin", () => {
         content: [{ type: "text", text: "export const x = 1;" }],
       });
 
-      // Verify event landed in DB at the OMP storage path
+      // Verify event landed in DB at the canonical OMP storage path.
+      // Issue #645 — production plugin resolves through
+      // `resolveSessionDbPath`, the same helper the MCP server uses.
       const { OMPAdapter } = await import("../../src/adapters/omp/index.js");
       const adapter = new OMPAdapter();
+      const { resolveSessionDbPath } = await import("../../src/session/db.js");
       const db = new SessionDB({
-        dbPath: join(adapter.getSessionDir(), "context-mode.db"),
+        dbPath: resolveSessionDbPath({
+          projectDir: tempDir,
+          sessionsDir: adapter.getSessionDir(),
+        }),
       });
       const latest = db.getLatestSessionId();
       expect(latest).not.toBeNull();
@@ -228,10 +241,16 @@ describe("OMP plugin", () => {
       await registerOmpPlugin(api);
       await api._trigger("session_start", { type: "session_start" }, {});
 
+      // Issue #645 — read from the canonical per-project path the
+      // production plugin (and the MCP server) uses.
       const { OMPAdapter } = await import("../../src/adapters/omp/index.js");
       const adapter = new OMPAdapter();
+      const { resolveSessionDbPath } = await import("../../src/session/db.js");
       const db = new SessionDB({
-        dbPath: join(adapter.getSessionDir(), "context-mode.db"),
+        dbPath: resolveSessionDbPath({
+          projectDir: tempDir,
+          sessionsDir: adapter.getSessionDir(),
+        }),
       });
       const latest = db.getLatestSessionId();
       expect(latest).not.toBeNull();
@@ -279,10 +298,16 @@ describe("OMP plugin", () => {
       const sid = pluginMod._getOmpPluginSessionIdForTests();
       expect(sid).not.toBe("");
 
+      // Issue #645 — production plugin writes to the canonical
+      // per-project path, not the shared "context-mode.db" literal.
       const { OMPAdapter } = await import("../../src/adapters/omp/index.js");
       const adapter = new OMPAdapter();
+      const { resolveSessionDbPath } = await import("../../src/session/db.js");
       const db = new SessionDB({
-        dbPath: join(adapter.getSessionDir(), "context-mode.db"),
+        dbPath: resolveSessionDbPath({
+          projectDir: tempDir,
+          sessionsDir: adapter.getSessionDir(),
+        }),
       });
       const resume = db.getResume(sid);
       expect(resume).not.toBeNull();
@@ -291,6 +316,135 @@ describe("OMP plugin", () => {
       const stats = db.getSessionStats(sid);
       expect(stats?.compact_count).toBe(1);
       void mod;
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Issue #645 — OMP plugin SessionDB path must match the MCP
+  // server's canonical resolver (`resolveSessionDbPath`). The
+  // shared `context-mode.db` literal diverges from the
+  // `<hash>.db` the server reads, silently breaking ctx_stats
+  // and ctx_search(sort: "timeline") for every OMP user.
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Issue #645: SessionDB path matches MCP server's canonical resolver", () => {
+    it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not the shared 'context-mode.db' literal", async () => {
+      // The OMP plugin resolves projectDir from PI_PROJECT_DIR (or
+      // cwd()) — see src/adapters/omp/plugin.ts. Set it explicitly
+      // so the canonical hash we compute below matches the hash the
+      // plugin uses when it opens its SessionDB.
+      const priorPi = process.env.PI_PROJECT_DIR;
+      process.env.PI_PROJECT_DIR = tempDir;
+      try {
+        await registerOmpPlugin(api);
+        await api._trigger("session_start", { type: "session_start" }, {});
+
+        const { OMPAdapter } = await import("../../src/adapters/omp/index.js");
+        const adapter = new OMPAdapter();
+        const sessionsDir = adapter.getSessionDir();
+
+        // Mirror the production resolver the MCP server uses
+        // (server.ts ctx_stats / ctx_search timeline). The plugin's
+        // write target MUST be this exact file or both MCP tools
+        // silently degrade.
+        const { resolveSessionDbPath } = await import("../../src/session/db.js");
+        const canonicalPath = resolveSessionDbPath({
+          projectDir: tempDir,
+          sessionsDir,
+        });
+
+        const { existsSync: fileExists } = await import("node:fs");
+        expect(fileExists(canonicalPath)).toBe(true);
+
+        // Verify the canonical file is the one with our session_start row.
+        const db = new SessionDB({ dbPath: canonicalPath });
+        try {
+          const latest = db.getLatestSessionId();
+          expect(latest).not.toBeNull();
+        } finally {
+          try { db.close(); } catch { /* best effort */ }
+        }
+
+        // The shared literal must NOT be created — that was the bug.
+        const buggyLiteralPath = join(sessionsDir, "context-mode.db");
+        if (canonicalPath !== buggyLiteralPath) {
+          expect(fileExists(buggyLiteralPath)).toBe(false);
+        }
+      } finally {
+        if (priorPi === undefined) {
+          delete process.env.PI_PROJECT_DIR;
+        } else {
+          process.env.PI_PROJECT_DIR = priorPi;
+        }
+      }
+    });
+  });
+
+  // ── Issue #677: package.json `omp` manifest key contract ──────────
+  //
+  // OMP's plugin runtime exposes TWO manifest-key resolvers (verified
+  // against oh-my-pi `packages/coding-agent/src/extensibility/plugins/
+  // loader.ts:179-189`):
+  //
+  //   resolvePluginHookPaths(plugin)        ← reads `omp.hooks`
+  //   resolvePluginExtensionPaths(plugin)   ← reads `omp.extensions`
+  //
+  // Only the `extensions` resolver is wired into the runtime
+  // (`extensions/loader.ts` imports `getAllPluginExtensionPaths` and
+  // executes the returned modules). The `hooks` resolver is defined and
+  // exported but never imported by any runtime consumer — a grep of the
+  // oh-my-pi tree confirms `resolvePluginHookPaths` / `getAllPlugin
+  // HookPaths` have ONE import site each, both inside `plugins/loader.ts`
+  // itself.
+  //
+  // Result: `omp.hooks` is a dead manifest key. Plugins that declare
+  // their entry under `hooks` install cleanly via `omp plugin install`
+  // but their handlers never register — every event silently no-ops.
+  // Issue #677 surfaced this in production: `tool_call`,
+  // `session_start`, `session_before_compact` all dropped after
+  // `omp plugin install context-mode`. The fix is mechanical — switch
+  // `omp.hooks` → `omp.extensions` in our package.json — but the dead
+  // key would silently come back any time someone copy-edits the
+  // manifest from an older example. This test pins the contract.
+  describe("package.json omp manifest (issue #677)", () => {
+    it("declares omp.extensions, NOT omp.hooks (dead key in OMP loader)", async () => {
+      const { readFileSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const repoRoot = resolve(__dirname, "..", "..");
+      const pkg = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf-8")) as {
+        omp?: { hooks?: unknown; extensions?: unknown };
+      };
+      expect(pkg.omp, "package.json must declare an `omp` field").toBeDefined();
+      expect(
+        pkg.omp!.hooks,
+        "package.json `omp.hooks` is a dead OMP loader key — use `omp.extensions` instead (see oh-my-pi plugins/loader.ts:179-189)",
+      ).toBeUndefined();
+      expect(
+        pkg.omp!.extensions,
+        "package.json `omp.extensions` must be set so OMP's runtime extension loader picks up the plugin",
+      ).toBeDefined();
+    });
+
+    it("omp.extensions is an array of resolvable plugin-relative paths", async () => {
+      const { readFileSync, existsSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const repoRoot = resolve(__dirname, "..", "..");
+      const pkg = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf-8")) as {
+        omp?: { extensions?: unknown };
+      };
+      // OMP's resolvePluginPaths accepts BOTH string and array
+      // (Array.isArray(base) ? base : [base]) but pi.extensions is an
+      // array — keep the same shape for consistency + reviewer clarity.
+      expect(Array.isArray(pkg.omp?.extensions)).toBe(true);
+      const paths = pkg.omp?.extensions as string[];
+      expect(paths.length).toBeGreaterThan(0);
+      for (const relPath of paths) {
+        expect(relPath, "extension path must be plugin-relative").toMatch(/^\.\//);
+        expect(
+          existsSync(resolve(repoRoot, relPath)),
+          `extension file ${relPath} must exist (run npm run build first)`,
+        ).toBe(true);
+      }
     });
   });
 });

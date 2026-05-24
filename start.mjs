@@ -174,7 +174,7 @@ if (cacheMatch) {
 // truth) so users who fix themselves via `npm install -g context-mode`
 // follow the exact same code path. Best-effort, never blocks MCP boot.
 try {
-  const { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, healMcpJsonArgs } =
+  const { healInstalledPlugins, healSettingsEnabledPlugins, healPluginJsonMcpServers, sweepStaleMcpJson } =
     await import("./scripts/heal-installed-plugins.mjs");
   const pluginKey = "context-mode@context-mode";
   const claudeConfigDir = resolveClaudeConfigDir();
@@ -193,12 +193,6 @@ try {
   // path baked in. Iterates EVERY installed cache entry's installPath so
   // multi-version installs all self-recover. Each call is independently wrapped
   // because one poisoned entry must not block heals on the others. Best effort.
-  //
-  // v1.0.122 — Layer 5b extended (Issue #531): asymmetric-heal sibling for the
-  // `.mcp.json` file Claude Code reads at plugin load. Same per-entry loop, same
-  // defensive wrap. Covers both the #253/aea633c bare `./start.mjs` fresh-install
-  // regression AND the /ctx-upgrade tmpdir leak class. Both heals must run on
-  // every boot so users self-recover regardless of which drift shape hit them.
   try {
     if (existsSync(registryPath)) {
       const ip = JSON.parse(readFileSync(registryPath, "utf-8"));
@@ -214,16 +208,19 @@ try {
               pluginKey,
             });
           } catch { /* best effort — per-entry */ }
-          try {
-            healMcpJsonArgs({
-              pluginRoot: installPath,
-              pluginCacheRoot,
-              pluginKey,
-            });
-          } catch { /* best effort — per-entry */ }
         }
       }
     }
+  } catch { /* best effort */ }
+  // Issue #609 — Layer 5c (replaces v1.0.122 healMcpJsonArgs per-entry loop):
+  // sweep stale `.mcp.json` files from every per-version cache dir. cli.ts
+  // no longer writes `.mcp.json` (PR fix for #609), so the only `.mcp.json`
+  // files in the cache are stale carry-forwards from earlier installs or
+  // Claude Code's plugin manager copying them between version dirs. Removing
+  // them blocks the previous-version-carry replay vector at MCP boot.
+  // One sweep per boot — bounded, idempotent, best-effort.
+  try {
+    sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
   } catch { /* best effort */ }
 } catch { /* best effort — never block MCP boot */ }
 
@@ -367,16 +364,47 @@ if (!process.env.VITEST) {
 // Ensure native dependencies + ABI compatibility (shared with hooks via ensure-deps.mjs)
 // ensure-deps handles better-sqlite3 install + ABI cache/rebuild automatically (#148, #203)
 import "./hooks/ensure-deps.mjs";
-// Also install pure-JS deps used by server
-for (const pkg of ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"]) {
-  if (!existsSync(resolve(__dirname, "node_modules", pkg))) {
+// Pure-JS runtime deps used only by `ctx_fetch_and_index` (HTML → Markdown
+// pipeline runs in a sandboxed subprocess that `require.resolve()`s these at
+// call time). Plugin distributions that bypass `npm install` — most notably
+// codex's marketplace, which git-clones into `~/.codex/plugins/cache/<pkg>/`
+// without installing dependencies — land here with no `node_modules/`.
+//
+// Before #634: synchronous `execSync("npm install …")` per package
+// (turndown + turndown-plugin-gfm + @mixmark-io/domino) blocked MCP boot
+// for ~15–25s cold. Codex's per-MCP `startup_timeout_sec` is 30s, so on
+// any host where its prewarm + DNS already eats a few seconds the timer
+// fires before context-mode replies to `initialize` and the MCP child is
+// dropped with "MCP client for `context-mode` timed out after 30 seconds".
+//
+// Fix: spawn each `npm install` detached + unref'd so it runs in the
+// background while the MCP server proceeds with its handshake. The deps
+// land asynchronously, well before any LLM-driven `ctx_fetch_and_index`
+// call can plausibly fire. If a user invokes that tool faster than the
+// install completes, the subprocess's own `require.resolve("turndown")`
+// failure surfaces a typed error to the caller — same posture as any
+// other missing-runtime-dep situation in that code path.
+{
+  const NPM_INSTALL_BG_PKGS = ["turndown", "turndown-plugin-gfm", "@mixmark-io/domino"];
+  const IS_WIN32 = process.platform === "win32";
+  const NPM_BIN = IS_WIN32 ? "npm.cmd" : "npm";
+  for (const pkg of NPM_INSTALL_BG_PKGS) {
+    if (existsSync(resolve(__dirname, "node_modules", pkg))) continue;
     try {
-      execSync(`npm install ${pkg} --no-package-lock --no-save --silent`, {
-        cwd: __dirname,
-        stdio: "pipe",
-        timeout: 120000,
-      });
-    } catch { /* best effort */ }
+      const child = spawn(
+        NPM_BIN,
+        ["install", pkg, "--no-package-lock", "--no-save", "--silent", "--no-audit", "--no-fund"],
+        {
+          cwd: __dirname,
+          stdio: "ignore",
+          detached: true,
+          // npm on Windows ships as a `.cmd` shim — must go through cmd.exe.
+          shell: IS_WIN32,
+        },
+      );
+      child.on("error", () => { /* best effort — npm missing, broken cache, etc. */ });
+      child.unref();
+    } catch { /* best effort — never block MCP boot */ }
   }
 }
 

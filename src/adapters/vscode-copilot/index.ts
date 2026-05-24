@@ -21,6 +21,7 @@ import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { CopilotBaseAdapter } from "../copilot-base.js";
+import { resolveContextModeDataRoot } from "../base.js";
 import type { CopilotHookInput, CopilotHookModule } from "../copilot-base.js";
 
 import type {
@@ -67,10 +68,35 @@ export class VSCodeCopilotAdapter extends CopilotBaseAdapter {
   }
 
   protected getProjectDir(): string {
-    return process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    // Cascade order (locked by tests/adapters/vscode-copilot.test.ts):
+    //   1. CLAUDE_PROJECT_DIR — top priority for users running VS Code under
+    //      Claude Code CLI.
+    //   2. VSCODE_CWD — exported by VS Code's bootstrap into every child it
+    //      spawns (refs/platforms/vscode-copilot/src/util/vs/base/common/
+    //      process.ts:31). The MCP child inherits it. Was previously missing
+    //      from this cascade — every direct VS Code Copilot session silently
+    //      lost its workspace folder. PR #689 5-agent EM audit (Phase A
+    //      claim verification) confirmed the gap; this is the minimal fix.
+    //   3. process.cwd() — last resort.
+    return (
+      process.env.CLAUDE_PROJECT_DIR
+      || process.env.VSCODE_CWD
+      || process.cwd()
+    );
   }
 
   getSessionDir(): string {
+    // Issue #649: CONTEXT_MODE_DATA_DIR wins over both the .github project
+    // dir and the ~/.vscode fallback so dev-container/CI users can pin
+    // storage to a writable volume regardless of whether a .github tree
+    // happens to exist in cwd.
+    const override = resolveContextModeDataRoot();
+    if (override) {
+      const overrideDir = join(override, "context-mode", "sessions");
+      mkdirSync(overrideDir, { recursive: true });
+      return overrideDir;
+    }
+
     // Prefer .github/context-mode/sessions/ if .github exists,
     // otherwise fall back to ~/.vscode/context-mode/sessions/
     const githubDir = resolve(".github", "context-mode", "sessions");

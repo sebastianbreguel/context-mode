@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { ContentStore } from "../../src/store.js";
-import { SessionDB } from "../../src/session/db.js";
+import { SessionDB, hashProjectDirCanonical } from "../../src/session/db.js";
 import { searchAllSources, type UnifiedSearchResult } from "../../src/search/unified.js";
 import { searchAutoMemory } from "../../src/search/auto-memory.js";
 import { extractSnippet, formatBatchQueryResults, positionsFromHighlight } from "../../src/server.js";
@@ -3102,32 +3102,35 @@ describe("searchAutoMemory", () => {
     );
 
     // Create user-level configDir for .claude
-    const claudeMemDir = join(CLAUDE_CONFIG, "memory");
-    mkdirSync(claudeMemDir, { recursive: true });
+    // Issue #663: memory dir is now scoped by projectDir hash to prevent
+    // cross-project contamination. Tests below cover both call shapes:
+    //   - projectDir=PROJECT_DIR (scoped) → reads <CLAUDE_CONFIG>/memory/<hash>
+    //   - projectDir=undefined  (legacy) → reads <CLAUDE_CONFIG>/memory
+    // Write fixtures to BOTH so each call shape sees the same content.
+    const projectHash = hashProjectDirCanonical(PROJECT_DIR);
+    const claudeMemScoped = join(CLAUDE_CONFIG, "memory", projectHash);
+    const claudeMemLegacy = join(CLAUDE_CONFIG, "memory");
+    mkdirSync(claudeMemScoped, { recursive: true });
+    mkdirSync(claudeMemLegacy, { recursive: true });
 
     writeFileSync(
       join(CLAUDE_CONFIG, "CLAUDE.md"),
       "Global user preferences: dark theme, vim keybindings.",
     );
 
-    writeFileSync(
-      join(claudeMemDir, "analytics_separation.md"),
-      "Analytics must be separate project, not inside context-mode. Datadog model.",
-    );
-    writeFileSync(
-      join(claudeMemDir, "push_to_next.md"),
-      "Always push to next branch, never feature branches.",
-    );
-    writeFileSync(
-      join(claudeMemDir, "npm_token.md"),
-      "npm publish token location for context-mode releases.",
-    );
-    writeFileSync(
-      join(claudeMemDir, "user_identity.md"),
-      "User name is Alice. Speaks English and French.",
-    );
+    const memoryFiles: Array<[string, string]> = [
+      ["analytics_separation.md", "Analytics must be separate project, not inside context-mode. Datadog model."],
+      ["push_to_next.md", "Always push to next branch, never feature branches."],
+      ["npm_token.md", "npm publish token location for context-mode releases."],
+      ["user_identity.md", "User name is Alice. Speaks English and French."],
+    ];
+    for (const [name, body] of memoryFiles) {
+      writeFileSync(join(claudeMemScoped, name), body);
+      writeFileSync(join(claudeMemLegacy, name), body);
+    }
 
-    // Create user-level configDir for .qwen
+    // Create user-level configDir for .qwen — Qwen tests below pass
+    // projectDir=undefined, so the unscoped path is the right fixture target.
     const qwenMemDir = join(QWEN_CONFIG, "memory");
     mkdirSync(qwenMemDir, { recursive: true });
     writeFileSync(join(QWEN_CONFIG, "CLAUDE.md"), "Qwen user config.");

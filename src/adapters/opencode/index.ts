@@ -34,7 +34,7 @@ import {
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
-import { BaseAdapter } from "../base.js";
+import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
 
 import type {
   HookAdapter,
@@ -259,7 +259,14 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDir(): string {
-    const dir = join(this.getConfigDir(), "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // ahead of OpenCode/Kilo's XDG-rooted default. opencode.json + plugin
+    // discovery stay under getConfigDir() so OpenCode itself sees its own
+    // config in the expected location.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -408,6 +415,15 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
       });
     }
 
+    if (this.hasLegacyContextModeMcp(settings)) {
+      results.push({
+        check: "Legacy MCP registration",
+        status: "warn",
+        message: "mcp.context-mode is redundant: ctx_* tools are now provided by the plugin",
+        fix: "context-mode upgrade (removes only mcp.context-mode; preserves other MCP servers)",
+      });
+    }
+
     // Note: SessionStart handled via experimental.chat.system.transform surrogate
     results.push({
       check: "SessionStart hook",
@@ -480,6 +496,17 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
     }
 
     settings.plugin = plugins;
+
+    const mcp = settings.mcp;
+    if (mcp && typeof mcp === "object" && !Array.isArray(mcp)) {
+      const servers = mcp as Record<string, unknown>;
+      if (Object.prototype.hasOwnProperty.call(servers, "context-mode")) {
+        delete servers["context-mode"];
+        changes.push("Removed legacy context-mode MCP block (plugin-native tools)");
+      }
+      if (Object.keys(servers).length === 0) delete settings.mcp;
+    }
+
     this.writeSettings(settings);
     return changes;
   }
@@ -520,6 +547,16 @@ export class OpenCodeAdapter extends BaseAdapter implements HookAdapter {
   private hasContextModePlugin(settings: Record<string, unknown>): boolean {
     const plugins = settings.plugin;
     return Array.isArray(plugins) && plugins.some((p: unknown) => typeof p === "string" && p.includes("context-mode"));
+  }
+
+  private hasLegacyContextModeMcp(settings: Record<string, unknown>): boolean {
+    const mcp = settings.mcp;
+    return !!(
+      mcp &&
+      typeof mcp === "object" &&
+      !Array.isArray(mcp) &&
+      Object.prototype.hasOwnProperty.call(mcp, "context-mode")
+    );
   }
 
   /**

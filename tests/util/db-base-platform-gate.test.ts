@@ -178,6 +178,171 @@ describe("v1.0.130 INVARIANT — SQLiteBase multi-writer default", () => {
 // a closed handle. This is the lifecycle invariant the lockfile tests
 // indirectly covered, made explicit.
 // ─────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────
+// Issue #642 — busy_timeout MUST propagate on the node:sqlite path.
+//
+// CONTRACT: every SQLiteBase ctor passes `{ timeout: 30000 }` to the
+// driver. better-sqlite3 honours that via the native constructor option;
+// the Bun branch propagates it via `adapter.pragma("busy_timeout = N")`
+// (#243). The node:sqlite branch (#228) was added later and silently
+// dropped the opts.timeout argument — node:sqlite ignores unknown
+// constructor options, so the DB opens with the SQLite default
+// `busy_timeout = 0`, and the first write contention surfaces as an
+// immediate `Error: database is locked` instead of the 30s grace that
+// `withRetry()` is engineered around.
+//
+// User-visible symptom: `SessionStart:startup hook error` banner on
+// Linux + Node ≥ 22.5 whenever the SessionStart hook opens the per-
+// project SessionDB while the long-running MCP server is mid-WAL-write
+// (reporter: Aleksandr Yeganov, 1.0.141, repro ~20% of fresh sessions).
+//
+// ADR alignment: docs/adr/0001-sessiondb-multi-writer.md says
+// "WAL + busy_timeout + withRetry handle the actual concurrency safely."
+// That contract holds only if busy_timeout is actually set. This test
+// pins the contract on the public factory.
+// ─────────────────────────────────────────────────────────
+describe("Issue #642 — loadDatabase() factory propagates busy_timeout", () => {
+  it.skipIf(!(globalThis as Record<string, unknown>).Bun && !(() => {
+    const [maj, min] = (process.versions.node ?? "0.0.0").split(".").map(Number);
+    return maj > 22 || (maj === 22 && min >= 5);
+  })())(
+    "INVARIANT: factory(path, { timeout: 30000 }) applies PRAGMA busy_timeout (#642)",
+    async () => {
+      // This invariant covers the node:sqlite + bun:sqlite paths where
+      // the upstream constructor does not understand `{ timeout }`. The
+      // better-sqlite3 path applies it natively via the C++ constructor
+      // option, so this test is a no-op on legacy Node — skip-gated to
+      // hasModernSqlite() runtimes only.
+      const { loadDatabase } = await import("../../src/db-base.js");
+      const Database = loadDatabase();
+      const dir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-busy-timeout-642-"));
+      const dbPath = join(dir, "busy.db");
+      let db: { pragma: (s: string) => unknown; close: () => void } | null = null;
+      try {
+        // The SessionDB + ContentStore ctors all open like this.
+        db = new (Database as unknown as new (p: string, o: { timeout: number }) => {
+          pragma: (s: string) => unknown;
+          close: () => void;
+        })(dbPath, { timeout: 30000 });
+        // Three driver shapes, one test:
+        //   - BunSQLiteAdapter / NodeSQLiteAdapter: collapse single-row
+        //     single-column PRAGMA to scalar (see pragma() in db-base.ts).
+        //   - better-sqlite3 default: returns [{ timeout: 30000 }].
+        // Normalise into a single number so the assertion is driver-
+        // agnostic — the contract under test is "SQLite stored the
+        // requested busy_timeout", not the wrapper's return shape.
+        const raw = db!.pragma("busy_timeout") as
+          | number
+          | { timeout: number }
+          | Array<{ timeout: number }>;
+        const observed = typeof raw === "number"
+          ? raw
+          : Array.isArray(raw)
+            ? raw[0]?.timeout
+            : raw.timeout;
+        // We asked for 30000ms. SQLite stores exactly that — assert
+        // equality so a future drop-back to 0 (the SQLite default) fails
+        // loudly. 0 is the SQLite-shipped default and the exact
+        // regression signature of the pre-fix node:sqlite path (#642).
+        expect(observed).toBe(30000);
+      } finally {
+        try { db?.close(); } catch { /* best effort */ }
+        try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    },
+  );
+});
+
+// ─────────────────────────────────────────────────────────
+// Issue #642 — direct node:sqlite branch coverage.
+//
+// The factory-level test above is driver-agnostic and exercises whichever
+// branch `loadDatabase()` resolves on the current host. On macOS, that's
+// usually better-sqlite3 (node:sqlite ships without FTS5 in the upstream
+// Homebrew node@22/23 builds), which means the macOS CI lane never
+// exercises the node:sqlite code path that #642 reported.
+//
+// This second slice covers the gap deterministically: it skip-gates only
+// on `node:sqlite` actually being importable (independent of FTS5),
+// constructs a NodeSQLiteAdapter the same way `NodeDatabaseFactory`
+// does, and asserts the busy_timeout propagation directly. If a future
+// edit drops the `adapter.pragma("busy_timeout = N")` call from the
+// factory, this test fails on every Node ≥ 22.5 host regardless of FTS5
+// status.
+// ─────────────────────────────────────────────────────────
+describe("Issue #642 — node:sqlite branch directly", () => {
+  const nodeSqliteAvailable = (() => {
+    try {
+      // Array.join mirrors the production import shape (esbuild dodge).
+      // We only need to know "is the built-in present", not actually use it
+      // here — the test body re-imports inside the `it()`.
+      require(["node", "sqlite"].join(":"));
+      return true;
+    } catch {
+      return false;
+    }
+  })();
+
+  // Source-pin invariant — independent of host runtime. Catches the
+  // FUTURE regression shape: a refactor that drops the busy_timeout
+  // propagation from NodeDatabaseFactory. The ADR-0001 multi-writer
+  // contract (WAL + busy_timeout + withRetry) becomes a lie the moment
+  // any factory branch fails to propagate. Mirrors the source-pin style
+  // used by the v1.0.130 INVARIANT block above.
+  it("INVARIANT: NodeDatabaseFactory MUST propagate busy_timeout via adapter.pragma (#642)", () => {
+    const dbBasePath = resolve(__dirname, "..", "..", "src", "db-base.ts");
+    const src = readFileSync(dbBasePath, "utf8");
+    const factoryIdx = src.indexOf("function NodeDatabaseFactory");
+    expect(factoryIdx).toBeGreaterThan(-1);
+    // Bound the factory body at the closing `} as any;` that wraps the
+    // assignment to `_Database` in the node:sqlite branch.
+    const factoryBody = src.slice(factoryIdx).split("} as any;")[0] ?? "";
+    // Anchor on `opts?.timeout` (the input) AND `busy_timeout` (the
+    // pragma name). Either alone is a false positive (the comment in the
+    // factory mentions one without the other). Both together pin the
+    // wiring.
+    expect(factoryBody).toMatch(/opts\?\.timeout/);
+    expect(factoryBody).toMatch(/busy_timeout/);
+    // Anchor on the call shape: `adapter.pragma(\`busy_timeout = ${opts.timeout}\`)`
+    // mirrors the Bun branch above. Whitespace-tolerant; opts may be
+    // narrowed with optional chaining or not.
+    expect(factoryBody).toMatch(/adapter\.pragma\s*\(\s*`busy_timeout\s*=\s*\$\{opts\??\.timeout\}`/);
+  });
+
+  it.skipIf(!nodeSqliteAvailable)(
+    "INVARIANT: NodeSQLiteAdapter wrapping factory sets PRAGMA busy_timeout when opts.timeout is supplied (#642)",
+    async () => {
+      const { NodeSQLiteAdapter } = await import("../../src/db-base.js");
+      // Built-in import is available on this host (skip-gate above).
+      const { DatabaseSync } = require(["node", "sqlite"].join(":")) as {
+        DatabaseSync: new (path: string, opts?: { readOnly?: boolean }) => unknown;
+      };
+      const dir = mkdtempSync(join(process.env.HOME || "/tmp", ".ctx-mode-642-node-direct-"));
+      const dbPath = join(dir, "direct.db");
+      let adapter: { pragma: (s: string) => unknown; close: () => void } | null = null;
+      try {
+        // Replicate NodeDatabaseFactory's open shape EXACTLY — readOnly
+        // false, no timeout in constructor (DatabaseSync ignores it
+        // anyway), then post-open busy_timeout propagation.
+        const raw = new DatabaseSync(dbPath, { readOnly: false });
+        adapter = new NodeSQLiteAdapter(raw) as typeof adapter;
+        // SQLite default before the fix: busy_timeout = 0 → immediate
+        // SQLITE_BUSY on any write contention. THIS is the bug.
+        const before = adapter!.pragma("busy_timeout") as number;
+        expect(before).toBe(0);
+        // The fix: propagate opts.timeout via PRAGMA, mirroring the Bun
+        // branch (db-base.ts:264-270).
+        adapter!.pragma(`busy_timeout = 30000`);
+        const after = adapter!.pragma("busy_timeout") as number;
+        expect(after).toBe(30000);
+      } finally {
+        try { adapter?.close(); } catch { /* best effort */ }
+        try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+      }
+    },
+  );
+});
+
 describe("v1.0.130 — SQLiteBase lifecycle composition", () => {
   it("close() then re-open on the same on-disk path succeeds (no leaked state)", async () => {
     // Mirror the multi-window "kill A, start B" flow: process A opens,

@@ -16,7 +16,8 @@ import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { SessionDB } from "../../session/db.js";
+import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
+import type { ProjectAttribution } from "../../session/project-attribution.js";
 import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
@@ -38,9 +39,22 @@ const PI_TOOL_MAP: Record<string, string> = {
 
 // ── Routing patterns ─────────────────────────────────────
 // Inline HTTP client patterns to block in bash — self-contained, no routing module needed.
-const BLOCKED_BASH_PATTERNS: RegExp[] = [
-  /\bcurl\s/,
-  /\bwget\s/,
+//
+// Issue #625 — split into two classes so we can apply different policies:
+//
+//   * BLOCKED_HTTP_PATTERNS — language-level HTTP calls (fetch, requests, http,
+//     urllib, Invoke-WebRequest). These always flood context with raw response
+//     bodies, so they remain unconditionally blocked.
+//
+//   * curl / wget — handled separately by isSafeCurlWget() below. Mirrors the
+//     reference logic in hooks/core/routing.mjs:660–722. Silent + file-output
+//     forms are allowed as an MCP-down escape hatch (the body never enters
+//     context). Unsafe forms (stdout, verbose, missing file output) still
+//     block. This prevents an unrecoverable session trap when the bridge dies.
+//
+// Both are evaluated AFTER stripQuotedContent() so quoted CLI arguments
+// (e.g. `gh issue list --search "curl wget"`) no longer false-positive.
+const BLOCKED_HTTP_PATTERNS: RegExp[] = [
   /\bfetch\s*\(/,
   /\brequests\.get\s*\(/,
   /\brequests\.post\s*\(/,
@@ -50,9 +64,75 @@ const BLOCKED_BASH_PATTERNS: RegExp[] = [
   /\bInvoke-WebRequest\b/,
 ];
 
+/**
+ * Strip heredoc + single-quoted + double-quoted content from a shell command
+ * so the routing regex only sees command tokens, not user-provided strings.
+ *
+ * Mirrors hooks/core/routing.mjs:196–209. Inlined here because the Pi
+ * extension is bundled as a standalone build artifact (.pi/extensions/...)
+ * and cannot import hooks/core/* at runtime — they live in a sibling tree
+ * and may not be present in every Pi installation.
+ *
+ * Exported for unit tests.
+ */
+export function stripQuotedContent(cmd: string): string {
+  return cmd
+    .replace(/<<-?\s*["']?(\w+)["']?[\s\S]*?\n\s*\1/g, "") // heredocs
+    .replace(/'[^']*'/g, "''") // single-quoted
+    .replace(/"[^"]*"/g, '""'); // double-quoted
+}
+
+/**
+ * Returns true iff `segment` is a curl/wget invocation that is SAFE to allow
+ * through the Pi routing block — i.e. it cannot flood the model's context
+ * window because the response body is written to disk (or appended to a file)
+ * and no verbose/trace flag is dumping headers to stderr.
+ *
+ * Mirrors hooks/core/routing.mjs:672–701. Segments that are NOT curl/wget
+ * return `true` (nothing to evaluate). The caller is expected to split chained
+ * commands on `&&`, `||`, `;` and call this per segment.
+ *
+ * Issue #625 — without this, the only escape hatch when the MCP bridge dies
+ * is `gh` CLI or a full Pi restart. Neither is acceptable as baseline UX.
+ *
+ * Exported for unit tests.
+ */
+export function isSafeCurlWget(segment: string): boolean {
+  const s = segment.trim();
+  const isCurl = /\bcurl\b/i.test(s);
+  const isWget = /\bwget\b/i.test(s);
+  if (!isCurl && !isWget) return true; // not curl/wget — nothing to evaluate
+
+  // Check for file output flags (-o file / --output file for curl,
+  // -O file / --output-document file for wget) OR shell redirection (> / >>).
+  const hasFileOutput = isCurl
+    ? /\s(-o|--output)\s/.test(s) || /\s>\s*/.test(s) || /\s>>\s*/.test(s)
+    : /\s(-O|--output-document)\s/.test(s) ||
+      /\s>\s*/.test(s) ||
+      /\s>>\s*/.test(s);
+  if (!hasFileOutput) return false; // no file output → body flows to stdout
+
+  // Stdout aliases: -o -, -o /dev/stdout, -O -, -O /dev/stdout.
+  if (isCurl && /\s(-o|--output)\s+(-|\/dev\/stdout)(\s|$)/.test(s))
+    return false;
+  if (isWget && /\s(-O|--output-document)\s+(-|\/dev\/stdout)(\s|$)/.test(s))
+    return false;
+
+  // Verbose/trace flags dump request+response headers to stderr → context.
+  if (/\s(-v|--verbose|--trace)\b/.test(s)) return false;
+
+  // Must be silent (curl: -s/--silent, wget: -q/--quiet) so the progress bar
+  // does not spill into stderr → context.
+  const isSilent = isCurl
+    ? /\s-[a-zA-Z]*s|--silent/.test(s)
+    : /\s-[a-zA-Z]*q|--quiet/.test(s);
+  return isSilent;
+}
+
 // ── Module-level DB singleton ────────────────────────────
 
 let _db: SessionDB | null = null;
+let _dbPath = "";
 let _sessionId = "";
 
 // MCP bridge handle. The bridge spawns server.bundle.mjs once and
@@ -128,13 +208,36 @@ function getSessionDir(): string {
   return dir;
 }
 
-function getDBPath(): string {
-  return join(getSessionDir(), "context-mode.db");
+// Issue #645 — the MCP server (src/server.ts ctx_stats / ctx_search
+// timeline) resolves the SessionDB filename via
+// `resolveSessionDbPath({ projectDir, sessionsDir })`, which produces a
+// per-project canonical `<16-hex-hash>.db` (case-folded on darwin/win32,
+// suffixed for non-main worktrees). The Pi extension previously wrote
+// every session to a shared `context-mode.db` literal — a different
+// file the server never reads. The result was silent degradation of
+// `ctx_stats` (zero history) and `ctx_search(sort: "timeline")` (sort
+// dropped) for every Pi user. Routing through the same helper keeps the
+// extension-side writes and the server-side reads aligned across
+// case-fold migrations, worktree suffixes, and any future change to the
+// canonical filename contract.
+function getDBPath(projectDir: string): string {
+  return resolveSessionDbPath({ projectDir, sessionsDir: getSessionDir() });
 }
 
-function getOrCreateDB(): SessionDB {
-  if (!_db) {
-    _db = new SessionDB({ dbPath: getDBPath() });
+function getOrCreateDB(projectDir: string): SessionDB {
+  // Reopen the singleton if the resolved DB path changes. Production code
+  // normally loads the extension once per process with a single workspace,
+  // but defensive re-keying on path keeps the contract honest if a host
+  // ever calls piExtension(pi) twice with different projectDirs, and
+  // removes a subtle test-isolation foot-gun where stale singletons
+  // pointed at a prior test's `<hash>.db`. (#645)
+  const dbPath = getDBPath(projectDir);
+  if (!_db || _dbPath !== dbPath) {
+    if (_db) {
+      try { _db.close(); } catch { /* best effort */ }
+    }
+    _db = new SessionDB({ dbPath });
+    _dbPath = dbPath;
   }
   return _db;
 }
@@ -332,7 +435,13 @@ export default function piExtension(pi: any): void {
     cwd: process.cwd(),
   });
 
-  const db = getOrCreateDB();
+  // Attribution object for project isolation — ensures every event recorded
+  // by the pi adapter carries the correct project_dir. Without this, all
+  // events default to project_dir="" which causes cross-project data leakage
+  // in shared SessionDB instances.
+  const _attribution: Partial<ProjectAttribution> = { projectDir, source: "workspace_root", confidence: 0.98 };
+
+  const db = getOrCreateDB(projectDir);
 
   // ── 1. session_start — Initialize session ──────────────
 
@@ -360,14 +469,39 @@ export default function piExtension(pi: any): void {
       const command = String(event?.input?.command ?? "");
       if (!command) return;
 
-      const isBlocked = BLOCKED_BASH_PATTERNS.some((p) => p.test(command));
-      if (isBlocked) {
+      // Issue #625 — strip quoted content first so words like `curl` inside
+      // a `gh issue list --search "...curl..."` argument do not false-positive.
+      const stripped = stripQuotedContent(command);
+
+      // Language-level HTTP calls (fetch, requests, http, urllib,
+      // Invoke-WebRequest) always flood context — block unconditionally.
+      if (BLOCKED_HTTP_PATTERNS.some((p) => p.test(stripped))) {
         return {
           block: true,
           reason:
             "Use context-mode MCP tools (execute, fetch_and_index) instead of inline HTTP clients. " +
-            "Raw curl/wget/fetch output floods the context window.",
+            "Raw fetch/requests/http output floods the context window.",
         };
+      }
+
+      // curl / wget — split chained command on &&, ||, ; and evaluate each
+      // segment with isSafeCurlWget(). Allowed if EVERY curl/wget segment is
+      // silent + file-output + no verbose + no stdout alias. This preserves
+      // the "do not flood context" intent while leaving a recovery path open
+      // when the MCP bridge is unreachable.
+      if (/(^|\s|&&|\||\;)(curl|wget)\s/i.test(stripped)) {
+        const segments = stripped.split(/\s*(?:&&|\|\||;)\s*/);
+        const hasUnsafeSegment = segments.some((seg) => !isSafeCurlWget(seg));
+        if (hasUnsafeSegment) {
+          return {
+            block: true,
+            reason:
+              "Use context-mode MCP tools (execute, fetch_and_index) instead of inline HTTP clients. " +
+              "Raw curl/wget output floods the context window. " +
+              "For an MCP-down escape hatch, use silent + file output: " +
+              "`curl -s -o /tmp/x.json URL` or `wget -q -O /tmp/x.json URL`.",
+          };
+        }
       }
     } catch {
       // Routing failure — allow passthrough
@@ -381,8 +515,14 @@ export default function piExtension(pi: any): void {
       if (!_sessionId) return;
 
       const rawToolName = String(event?.toolName ?? event?.tool_name ?? "");
-      const mappedToolName =
+      let mappedToolName =
         PI_TOOL_MAP[rawToolName.toLowerCase()] ?? rawToolName;
+
+      // Pi namespaces MCP-registered tools with the "context_mode_" prefix;
+      // the extract functions expect the "mcp__" prefix for MCP tool calls.
+      if (/^context_mode_/.test(rawToolName)) {
+        mappedToolName = rawToolName.replace(/^context_mode_/, "mcp__context_mode__");
+      }
 
       // Normalize result to string
       const rawResult = event?.result ?? event?.output;
@@ -396,9 +536,17 @@ export default function piExtension(pi: any): void {
       // Detect errors
       const hasError = Boolean(event?.error || event?.isError);
 
+      // Pi sends file tool parameters as "path"; the extract functions
+      // expect "file_path" (Claude Code convention). Normalise before
+      // passing to extractEvents so file reads/writes/edits are tracked.
+      const rawInput = { ...(event?.params ?? event?.input ?? {}) };
+      if (rawInput.path !== undefined && rawInput.file_path === undefined) {
+        rawInput.file_path = String(rawInput.path);
+      }
+
       const hookInput: HookInput = {
         tool_name: mappedToolName,
-        tool_input: event?.params ?? event?.input ?? {},
+        tool_input: rawInput,
         tool_response: resultStr,
         tool_output: hasError ? { isError: true } : undefined,
       };
@@ -407,7 +555,7 @@ export default function piExtension(pi: any): void {
 
       if (events.length > 0) {
         for (const ev of events) {
-          db.insertEvent(_sessionId, ev as SessionEvent, "PostToolUse");
+          db.insertEvent(_sessionId, ev as SessionEvent, "PostToolUse", _attribution);
         }
       } else if (rawToolName) {
         // Fallback: record unrecognized tool call as generic event
@@ -427,7 +575,7 @@ export default function piExtension(pi: any): void {
               .digest("hex")
               .slice(0, 16),
           },
-          "PostToolUse",
+          "PostToolUse", _attribution,
         );
       }
     } catch {
@@ -460,7 +608,7 @@ export default function piExtension(pi: any): void {
       if (prompt) {
         const userEvents = extractUserEvents(prompt);
         for (const ev of userEvents) {
-          db.insertEvent(_sessionId, ev as SessionEvent, "UserPromptSubmit");
+          db.insertEvent(_sessionId, ev as SessionEvent, "UserPromptSubmit", _attribution);
         }
       }
 
@@ -484,6 +632,7 @@ export default function piExtension(pi: any): void {
         minPriority: 3,
         limit: 50,
       });
+      let behavioralDirective = "";
       if (activeEvents.length > 0) {
         const buildAuto = await getAutoInjection(pluginRoot);
         let memoryContext = "";
@@ -494,6 +643,14 @@ export default function piExtension(pi: any): void {
               data: String(e.data ?? ""),
             })),
           );
+          const bdMatch = memoryContext.match(/(<behavioral_directive>\n[^<]*\n<\/behavioral_directive>)/);
+          if (bdMatch) {
+            behavioralDirective = bdMatch[1];
+            memoryContext = memoryContext.replace(bdMatch[1], "");
+            if (memoryContext.match(/^<session_state[^>]*>\s*<\/session_state>\s*$/)) {
+              memoryContext = "";
+            }
+          }
         }
         // Fallback (or if helper produced empty output): inline 500-token cap.
         if (!memoryContext) {
@@ -517,6 +674,8 @@ export default function piExtension(pi: any): void {
         parts.push(resume.snapshot);
         db.markResumeConsumed(_sessionId);
       }
+
+      if (behavioralDirective) parts.push(behavioralDirective);
 
       // Return modified systemPrompt only if we added something beyond existing.
       const baseLen = existingPrompt ? 1 : 0;
@@ -561,7 +720,7 @@ export default function piExtension(pi: any): void {
           priority: 1,
           data_hash: createHash("sha256").update(data).digest("hex").slice(0, 16),
         },
-        "PostToolUse",
+        "PostToolUse", _attribution,
       );
     } catch {
       // best effort — never break provider response
@@ -607,6 +766,7 @@ export default function piExtension(pi: any): void {
         _db.cleanupOldSessions(7);
       }
       _db = null;
+      _dbPath = "";
       _sessionId = "";
     } catch {
       // best effort — never throw during shutdown
@@ -655,7 +815,7 @@ export default function piExtension(pi: any): void {
     description: "Run context-mode diagnostics",
     handler: async (argsOrCtx: unknown, maybeCtx: unknown) => {
       const ctx = resolveCommandContext(argsOrCtx, maybeCtx);
-      const dbPath = getDBPath();
+      const dbPath = getDBPath(projectDir);
       const dbExists = existsSync(dbPath);
       const lines: string[] = [
         "## ctx-doctor (Pi)",

@@ -14,6 +14,7 @@
  * Track: https://github.com/openai/codex/issues/18491
  */
 
+import { execFileSync } from "node:child_process";
 import {
   readFileSync,
   writeFileSync,
@@ -25,7 +26,8 @@ import {
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { BaseAdapter } from "../base.js";
+import { BaseAdapter, resolveContextModeDataRoot } from "../base.js";
+import { hashProjectDirCanonical } from "../../session/db.js";
 import { resolveCodexConfigDir } from "./paths.js";
 
 import {
@@ -112,6 +114,36 @@ const LEGACY_HOOK_PATH_SUFFIXES: Record<keyof typeof CODEX_HOOK_COMMANDS, string
   UserPromptSubmit: ["hooks/userpromptsubmit.mjs", "hooks/codex/userpromptsubmit.mjs"],
   Stop: ["hooks/stop.mjs", "hooks/codex/stop.mjs"],
 };
+
+type CodexVersionRunner = (
+  file: string,
+  args: string[],
+  options: {
+    encoding: BufferEncoding;
+    stdio: ["ignore", "pipe", "ignore"];
+    timeout: number;
+  },
+) => string | Buffer;
+
+export function probeCodexCliVersion(runCommand: CodexVersionRunner = execFileSync): string | null {
+  try {
+    const output = process.platform === "win32"
+      ? runCommand("cmd.exe", ["/d", "/s", "/c", "codex --version"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5000,
+      })
+      : runCommand("codex", ["--version"], {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1500,
+      });
+    const version = String(output).trim();
+    return version.length > 0 ? version : "available (version output empty)";
+  } catch {
+    return null;
+  }
+}
 
 function getTomlSection(raw: string, sectionName: string): string | null {
   const lines = raw.split(/\r?\n/);
@@ -324,7 +356,14 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDir(): string {
-    const dir = join(this.getConfigDir(), "context-mode", "sessions");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+    // before falling back to the $CODEX_HOME-rooted default. Settings.toml
+    // and hooks.json continue to live under getConfigDir() so the Codex CLI
+    // sees its own config in the expected place.
+    const override = resolveContextModeDataRoot();
+    const dir = override
+      ? join(override, "context-mode", "sessions")
+      : join(this.getConfigDir(), "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -341,9 +380,20 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
     return ["AGENTS.md", "AGENTS.override.md"];
   }
 
-  getMemoryDir(): string {
+  getMemoryDir(projectDir?: string): string {
     // Codex uses "memories" (plural), not the default "memory".
-    return join(this.getConfigDir(), "memories");
+    // Issue #649: honor CONTEXT_MODE_DATA_DIR for context-mode-owned
+    // persistent memory while preserving the platform-native plural folder
+    // name so legacy Codex tooling continues to find it when DATA_DIR is
+    // unset. Under the override, layout is `<DATA_DIR>/context-mode/memories`.
+    // Issue #663: scope by projectDir hash so parallel projects can't
+    // read each other's memory.
+    const override = resolveContextModeDataRoot();
+    const base = override
+      ? join(override, "context-mode", "memories")
+      : join(this.getConfigDir(), "memories");
+    if (!projectDir) return base;
+    return join(base, hashProjectDirCanonical(projectDir));
   }
 
   generateHookConfig(_pluginRoot: string): HookRegistration {
@@ -440,6 +490,16 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
 
   validateHooks(_pluginRoot: string): DiagnosticResult[] {
     const results: DiagnosticResult[] = [];
+    const codexCliVersion = probeCodexCliVersion();
+
+    results.push({
+      check: "Codex CLI binary",
+      status: codexCliVersion ? "pass" : "warn",
+      message: codexCliVersion
+        ? `codex --version resolved to ${codexCliVersion}`
+        : "Could not run codex --version; hooks need the Codex CLI available on PATH",
+      ...(codexCliVersion ? {} : { fix: "Install Codex CLI or make codex available on PATH" }),
+    });
 
     try {
       const raw = readFileSync(this.getSettingsPath(), "utf-8");
@@ -502,7 +562,7 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
     }
 
     const expected = this.generateHookConfig("");
-    return results.concat(Object.entries(expected).map(([hookName, entries]) => {
+    const hookChecks = Object.entries(expected).map(([hookName, entries]) => {
       const actualEntries = hookConfig.config.hooks?.[hookName];
       const expectedEntry = entries[0];
       const ok = Array.isArray(actualEntries)
@@ -511,7 +571,7 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
 
       return {
         check: `${hookName} hook`,
-        status: ok ? "pass" : missingStatus,
+        status: (ok ? "pass" : missingStatus) as "pass" | "warn" | "fail",
         message: ok
           ? `${hookName} hook configured in ${this.getHooksPath()}`
           : hookName === "PreCompact"
@@ -519,7 +579,31 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
             : `${hookName} hook missing or not pointing to context-mode`,
         fix: ok ? undefined : `Update ${this.getHooksPath()} to match configs/codex/hooks.json`,
       };
-    }));
+    });
+
+    // #603: surface duplicate context-mode entries per hook event. Codex fires
+    // every matching entry, so duplicates double the work, can saturate the
+    // MCP transport (`Transport closed`), and have been observed to inflate
+    // codex-tui.log into the multi-GB range. `context-mode upgrade` collapses
+    // them via `upsertManagedHookEntry`, so the fix is one command away.
+    const duplicateChecks: DiagnosticResult[] = [];
+    for (const hookName of Object.keys(expected)) {
+      const actualEntries = hookConfig.config.hooks?.[hookName];
+      if (!Array.isArray(actualEntries)) continue;
+      const managedCount = actualEntries.filter(
+        (entry) => this.isManagedContextModeEntry(hookName, entry as HookEntry),
+      ).length;
+      if (managedCount > 1) {
+        duplicateChecks.push({
+          check: `${hookName} duplicates`,
+          status: "warn",
+          message: `${managedCount} context-mode entries found for ${hookName} in ${this.getHooksPath()}; Codex will fire all of them`,
+          fix: "context-mode upgrade (collapses duplicate context-mode entries; preserves unrelated hooks)",
+        });
+      }
+    }
+
+    return results.concat(hookChecks, duplicateChecks);
   }
 
   checkPluginRegistration(): DiagnosticResult {
@@ -564,8 +648,9 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getInstalledVersion(): string {
-    // Codex CLI has no marketplace or plugin system
-    return "not installed";
+    // Codex uses standalone MCP registration; there is no platform-owned
+    // plugin version to compare against the context-mode npm package.
+    return "standalone";
   }
 
   // ── Upgrade ────────────────────────────────────────────

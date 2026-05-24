@@ -146,6 +146,30 @@ describe("Pi Extension", () => {
         tool_result: "ok",
       });
     });
+
+    it("maps 'context_mode_' prefix to 'mcp__context_mode__' so MCP tool calls get extracted", async () => {
+      await registerPiExtension(api);
+      await api._trigger("session_start", {
+        session_id: "test-fix1",
+        project_dir: tempDir,
+      });
+
+      // Pi prefixes MCP-registered tools with "context_mode_". Without
+      // normalisation the extract functions (P, F) silently drop all
+      // events because they gate on e.startsWith("mcp__").
+      await api._trigger("tool_result", {
+        tool_name: "context_mode_ctx_execute",
+        params: { language: "javascript", code: "console.log(1)" },
+        result: "1",
+      });
+
+      // Verify via ctx-stats that events include "mcp" category
+      // (meaning they were extracted, not just the generic fallback).
+      const stats = (await api._getCommand("ctx-stats")!.handler!({})) as {
+        text: string;
+      };
+      expect(stats.text).toContain("mcp");
+    });
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -174,6 +198,31 @@ describe("Pi Extension", () => {
         tool_input: { file_path: "/src/index.ts" },
         tool_result: "export const hello = 'world';",
       });
+    });
+
+    it("extracts file_read event when Pi passes 'path' instead of 'file_path'", async () => {
+      await registerPiExtension(api);
+      await api._trigger("session_start", {
+        session_id: "test-fix2",
+        project_dir: tempDir,
+      });
+
+      // Pi's native Read tool sends { path: "..." } rather than
+      // { file_path: "..." } (Claude Code convention). Without
+      // normalisation the extractor reads n.file_path → undefined,
+      // producing file_read events with an empty path.
+      await api._trigger("tool_result", {
+        tool_name: "read",
+        params: { path: "/src/index.ts" },
+        result: "export const hello = 'world';",
+      });
+
+      // Verify the file_read event was captured by checking
+      // ctx-stats shows "file" category events.
+      const stats = (await api._getCommand("ctx-stats")!.handler!({})) as {
+        text: string;
+      };
+      expect(stats.text).toContain("file");
     });
 
     it("extracts cwd event from cd command", async () => {
@@ -278,6 +327,167 @@ describe("Pi Extension", () => {
       // Should not throw, and should passthrough
       if (result) {
         expect(result.blocked).not.toBe(true);
+      }
+    });
+
+    // ── Issue #625 — escape hatches + quoted-string false positives ──
+    //
+    // The original BLOCKED_BASH_PATTERNS blocked every curl/wget unconditionally
+    // and matched inside quoted CLI arguments. Two consequences:
+    //
+    //   1. False positive: `gh issue list --search "...curl..."` was blocked
+    //      because the literal word `curl` appeared inside the quoted search
+    //      argument. The reporter literally could not file the issue via `gh`
+    //      until they rephrased the query.
+    //
+    //   2. Unrecoverable trap: when the MCP bridge dies, the agent's only
+    //      escape hatch is a disk-buffered HTTP download (curl -s -o file).
+    //      With every curl/wget invocation blocked, there is no way to fetch
+    //      a URL until the user restarts Pi entirely.
+    //
+    // Fix mirrors hooks/core/routing.mjs:660–722:
+    //   - Strip quoted content before regex matching
+    //   - Split on chain operators (&&, ||, ;)
+    //   - Allow segments that are: silent (-s/-q) + file output (-o/-O or >)
+    //     + no verbose (-v) + no stdout alias (-o -, -o /dev/stdout)
+    //
+    // This preserves the original "do not flood context" intent while letting
+    // the agent gracefully self-recover when MCP is unreachable.
+
+    it("does NOT block gh command with 'curl' inside quoted --search argument (Issue #625 bonus)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command: 'gh issue list --search "BLOCKED_BASH_PATTERNS curl wget block"',
+        },
+      });
+
+      // The literal word "curl" appears only inside a quoted argument; the
+      // command itself is `gh`, which has nothing to do with HTTP fetching.
+      // Stripping quoted content before matching must allow this through.
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("does NOT block echo with 'wget' inside a quoted log message (Issue #625 bonus)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command: 'echo "users tried to wget the bundle and it failed"',
+        },
+      });
+
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("allows curl with silent + file output for MCP-down recovery (Issue #625)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -s -o /tmp/data.json https://example.com/api" },
+      });
+
+      // -s (silent) + -o file means the body never enters context. This must
+      // remain available as an escape hatch when ctx_fetch_and_index is
+      // unreachable (e.g. MCP bridge dead between requests).
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("allows wget with quiet + output-document for MCP-down recovery (Issue #625)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "wget -q -O /tmp/data.json https://example.com/api" },
+      });
+
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("still blocks curl that would flood context (no file output)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl https://example.com/big-response" },
+      });
+
+      // No -o flag → body goes straight to stdout → straight into context.
+      // Must remain blocked.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("still blocks curl -o - (explicit stdout alias)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -s -o - https://example.com/api" },
+      });
+
+      // -o - means stdout, which feeds context — must remain blocked even
+      // when silent flag is present.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("still blocks verbose curl (floods stderr → context)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -v -s -o /tmp/x.json https://example.com" },
+      });
+
+      // -v dumps request/response headers to stderr — flooding context.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("blocks chained command if ANY segment is unsafe curl", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "curl -s -o /tmp/a.json https://example.com/a && curl https://example.com/b",
+        },
+      });
+
+      // First segment safe, second unsafe → must block the whole chain.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("allows chained command where every curl segment is safe", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "curl -s -o /tmp/a.json https://example.com/a && curl -s -o /tmp/b.json https://example.com/b",
+        },
+      });
+
+      // Both segments: silent + file output + no stdout alias + no verbose.
+      // The chain must pass.
+      if (result) {
+        expect(result.block).not.toBe(true);
       }
     });
   });
@@ -578,13 +788,24 @@ describe("Pi Extension", () => {
           { sessionManager: { getSessionFile: () => sessionFile } },
         );
 
-        const dbPath = join(
+        // Issue #645 — Pi extension now resolves the SessionDB file
+        // through `resolveSessionDbPath`, the same helper the MCP
+        // server uses. The shared "context-mode.db" literal is gone;
+        // the file lives at <canonical-hash>.db (case-folded on
+        // darwin/win32, worktree-suffixed when applicable). Mirror
+        // the production resolver here so this test reads from the
+        // exact path the extension just wrote to.
+        const { resolveSessionDbPath } = await import("../src/session/db.js");
+        const sessionsDir = join(
           process.env.HOME!,
           ".pi",
           "context-mode",
           "sessions",
-          "context-mode.db",
         );
+        const dbPath = resolveSessionDbPath({
+          projectDir: process.env.PI_PROJECT_DIR!,
+          sessionsDir,
+        });
         const db = new SessionDB({ dbPath });
         try {
           // SQLite datetime('now') stores UTC as "YYYY-MM-DD HH:MM:SS".
@@ -1402,8 +1623,14 @@ describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
 
     // DB file must be created under the mocked dir — proof that the
     // extension routes through PiAdapter rather than the hardcoded
-    // ~/.pi/context-mode/sessions literal.
-    const expectedDbPath = join(mockedSessionDir, "context-mode.db");
+    // ~/.pi/context-mode/sessions literal. Issue #645: the filename
+    // inside that dir is the canonical per-project `<hash>.db`, the
+    // same one the MCP server reads via `resolveSessionDbPath`.
+    const { resolveSessionDbPath } = await import("../src/session/db.js");
+    const expectedDbPath = resolveSessionDbPath({
+      projectDir,
+      sessionsDir: mockedSessionDir,
+    });
     const { existsSync: fileExists } = await import("node:fs");
     expect(fileExists(expectedDbPath)).toBe(true);
 
@@ -1419,5 +1646,93 @@ describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
 
     delete process.env.PI_PROJECT_DIR;
     delete process.env.CLAUDE_PROJECT_DIR;
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// Issue #645 — Pi extension opens SessionDB at the canonical
+// per-project hash path (`<hash>.db`), the same file the MCP
+// server reads via `resolveSessionDbPath`. The shared
+// `context-mode.db` literal is divergent — `ctx_stats` and
+// `ctx_search(sort: "timeline")` silently degrade because the
+// MCP server resolves a `<hash>.db` that does not exist.
+// Regression test pins the contract: Pi must use the canonical
+// helper, NOT the hardcoded literal.
+// ═══════════════════════════════════════════════════════════
+
+describe("Pi extension SessionDB path matches MCP server's canonical resolver (#645)", () => {
+  let scratch: string;
+  let mockedSessionDir: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "pi-ext-645-"));
+    mockedSessionDir = join(scratch, "pi-sess");
+    mkdirSync(mockedSessionDir, { recursive: true });
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    vi.doUnmock("../src/adapters/pi/index.js");
+    vi.resetModules();
+    delete process.env.PI_PROJECT_DIR;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  });
+
+  it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not the shared 'context-mode.db' literal", async () => {
+    vi.doMock("../src/adapters/pi/index.js", () => {
+      class MockPiAdapter {
+        getSessionDir() {
+          return mockedSessionDir;
+        }
+      }
+      return { PiAdapter: MockPiAdapter };
+    });
+
+    const projectDir = join(scratch, "project");
+    mkdirSync(projectDir, { recursive: true });
+    process.env.PI_PROJECT_DIR = projectDir;
+    process.env.CLAUDE_PROJECT_DIR = projectDir;
+
+    const localApi = createMockPiApi();
+    const mod = await import("../src/adapters/pi/extension.js");
+    await mod.default(localApi);
+
+    await localApi._trigger("session_start", {}, {});
+
+    // The MCP server (src/server.ts) resolves the SessionDB path via
+    // resolveSessionDbPath({ projectDir, sessionsDir }). The Pi
+    // extension MUST write to the same file. Compute the canonical
+    // path with the SAME helper the server uses and require it to
+    // exist on disk after session_start.
+    const { resolveSessionDbPath } = await import("../src/session/db.js");
+    const canonicalPath = resolveSessionDbPath({
+      projectDir,
+      sessionsDir: mockedSessionDir,
+    });
+    const { existsSync: fileExists } = await import("node:fs");
+    expect(fileExists(canonicalPath)).toBe(true);
+
+    // The shared literal must NOT be created — that was the bug.
+    const buggyLiteralPath = join(mockedSessionDir, "context-mode.db");
+    // Only fail the "no literal" check when canonical ≠ literal.
+    // (They differ for any real projectDir → 16-hex hash.)
+    if (canonicalPath !== buggyLiteralPath) {
+      expect(fileExists(buggyLiteralPath)).toBe(false);
+    }
+
+    // ctx-doctor must surface the same canonical path so users
+    // diagnosing degraded ctx_stats see the actual on-disk file.
+    const doctor = localApi._getCommand("ctx-doctor");
+    expect(doctor?.handler).toBeDefined();
+    const result = await doctor!.handler!({}, { hasUI: false });
+    const text = String((result as { text?: string } | undefined)?.text ?? "");
+    expect(text).toContain(canonicalPath);
+
+    await localApi._trigger("session_shutdown");
   });
 });

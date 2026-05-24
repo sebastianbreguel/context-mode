@@ -32,24 +32,7 @@ import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { AdapterPlatformType, OpenCodeAdapter } from "./index.js";
 import { PLATFORM_ENV_VARS } from "../detect.js";
-
-// Read package.json version once at module load (not on every hook call).
-// Used in the resume-injection visible signal so users can confirm in
-// OPENCODE_DEBUG logs which plugin version actually injected.
-const VERSION: string = (() => {
-  try {
-    const pkgRoot = dirname(fileURLToPath(import.meta.url));
-    // Search both the legacy depths (when bundled flat under build/) and
-    // the post-refactor depths (when compiled to build/adapters/opencode/).
-    // `../../../package.json` is the canonical location after the
-    // `src/opencode-plugin.ts → src/adapters/opencode/plugin.ts` move.
-    for (const rel of ["../../../package.json", "../package.json", "./package.json"]) {
-      const p = resolve(pkgRoot, rel);
-      if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8")).version ?? "unknown";
-    }
-  } catch { /* fall through */ }
-  return "unknown";
-})();
+import { zod3ShapeToV4 } from "./zod3tov4.js";
 
 // ── Types ─────────────────────────────────────────────────
 
@@ -81,6 +64,25 @@ type PluginClient = {
 type PluginContext = {
   client: PluginClient;
   directory: string;
+};
+
+type NativeToolContext = {
+  sessionID: string;
+  messageID: string;
+  agent: string;
+  directory: string;
+  worktree?: string;
+  abort?: AbortSignal;
+  metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void;
+};
+
+type NativeToolDefinition = {
+  description: string;
+  args: Record<string, unknown>;
+  execute: (
+    args: Record<string, unknown>,
+    ctx: NativeToolContext,
+  ) => Promise<string | { title?: string; output: string; metadata?: Record<string, unknown> }>;
 };
 
 /** OpenCode tool.execute.before — first parameter */
@@ -370,7 +372,102 @@ async function createContextModePlugin(ctx: PluginContext) {
     }
   }
 
+  async function buildNativeTools(): Promise<Record<string, NativeToolDefinition>> {
+    // Import the existing MCP server registry without starting its stdio
+    // transport. This is the plugin-only bridge for #574: OpenCode/Kilo
+    // call ctx_* tools in-process through Hooks.tool instead of spawning
+    // a separate MCP child per session.
+    const prevEmbedded = process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+    process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = "1";
+    let mod: typeof import("../../server.js");
+    try {
+      mod = await import("../../server.js");
+    } finally {
+      if (prevEmbedded === undefined) delete process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+      else process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
+    }
+    const tools: Record<string, NativeToolDefinition> = {};
+
+    for (const registered of mod.REGISTERED_CTX_TOOLS) {
+      const config = registered.config as Record<string, unknown>;
+      // Zod schema object that the MCP framework normally calls
+      // safeParseAsync() on before invoking the handler. The native
+      // OpenCode plugin path bypasses MCP's transport layer entirely
+      // (refs/platforms/opencode/packages/opencode/src/tool/registry.ts:127),
+      // so we must parse args here too — otherwise z.preprocess() coercions
+      // (coerceCommandsArray / coerceJsonArray in server.ts) and defaults
+      // never fire. Fixes #621.
+      const inputSchema = config.inputSchema as
+        | { shape?: unknown; _def?: { shape?: unknown }; parse?: (input: unknown) => unknown }
+        | undefined;
+      const shape =
+        typeof inputSchema?.shape === "object" && inputSchema.shape !== null
+          ? inputSchema.shape
+          : typeof inputSchema?._def?.shape === "function"
+            ? (inputSchema._def.shape as () => unknown)()
+            : {};
+
+      const argsForHost = platform === "kilo"
+        ? zod3ShapeToV4(shape as Record<string, unknown>)
+        : shape as Record<string, unknown>;
+
+      tools[registered.name] = {
+        description: String(config.description ?? ""),
+        args: argsForHost,
+        async execute(args: Record<string, unknown>, toolCtx: NativeToolContext) {
+          toolCtx.metadata?.({ title: String(config.title ?? registered.name) });
+          const project = toolCtx.directory || projectDir;
+
+          // Run the registered Zod schema BEFORE the handler — same contract
+          // as the MCP SDK (server/mcp.js safeParseAsync at line 174). This
+          // applies z.preprocess() coercions, populates .default() values,
+          // and produces the validation error the handler expects (#621).
+          let parsedArgs: Record<string, unknown> = args ?? {};
+          if (typeof inputSchema?.parse === "function") {
+            try {
+              parsedArgs = inputSchema.parse(args ?? {}) as Record<string, unknown>;
+            } catch (err) {
+              // Surface validation failures with a clear, actionable message
+              // (mirrors MCP SDK error format) instead of a downstream
+              // "x.map is not a function" crash.
+              const message = err instanceof Error ? err.message : String(err);
+              throw new Error(
+                `Invalid arguments for ${registered.name}: ${message}`,
+              );
+            }
+          }
+
+          const result = await mod.withProjectDirOverride({ projectDir: project, sessionId: toolCtx.sessionID }, async () =>
+            registered.handler(parsedArgs),
+          );
+
+          const r = result as {
+            content?: Array<{ type?: string; text?: string }>;
+            isError?: boolean;
+          };
+          const text = Array.isArray(r?.content)
+            ? r.content
+                .filter((c) => c?.type === "text" && typeof c.text === "string")
+                .map((c) => c.text)
+                .join("\n")
+            : typeof result === "string"
+              ? result
+              : JSON.stringify(result ?? "");
+
+          if (r?.isError) throw new Error(text || `${registered.name} returned an error`);
+          return { title: String(config.title ?? registered.name), output: text };
+        },
+      };
+    }
+
+    return tools;
+  }
+
+  const nativeTools = await buildNativeTools();
+
   return {
+    tool: nativeTools,
+
     // ── PreToolUse: Routing enforcement ─────────────────
 
     "tool.execute.before": async (input: BeforeHookInput, output: BeforeHookOutput) => {

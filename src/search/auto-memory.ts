@@ -9,6 +9,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join, isAbsolute } from "node:path";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
+import { hashProjectDirCanonical } from "../session/db.js";
 
 const DEBUG = process.env.DEBUG?.includes("context-mode");
 
@@ -27,7 +28,12 @@ export interface AutoMemoryResult {
 export interface AutoMemoryAdapter {
   getConfigDir(): string;
   getInstructionFiles(): string[];
-  getMemoryDir(): string;
+  /**
+   * `projectDir` is optional for backwards compatibility with legacy
+   * callers — when supplied, adapters MUST return a project-scoped path
+   * (see HookAdapter.getMemoryDir contract, issue #663).
+   */
+  getMemoryDir(projectDir?: string): string;
 }
 
 /**
@@ -66,10 +72,18 @@ export function searchAutoMemory(
   // CC config trees (and empty/whitespace env doesn't poison the path).
   const adapterRelative = adapterConfigDir ? resolveAgainst(projectDir, adapterConfigDir) : null;
   const effectiveConfigDir = adapterRelative ?? configDir ?? resolveClaudeConfigDir();
-  const adapterMemoryDir = adapter?.getMemoryDir();
+  // Issue #663: scope memory dir by projectDir so parallel projects can't
+  // read each other's auto-memory. Adapter-aware path delegates the
+  // scoping to the adapter; legacy adapterless fallback applies the same
+  // hash directly so the contract holds at both call sites.
+  const adapterMemoryDir = adapter?.getMemoryDir(projectDir);
+  const fallbackMemoryBase = join(effectiveConfigDir, "memory");
+  const fallbackMemoryDir = projectDir
+    ? join(fallbackMemoryBase, hashProjectDirCanonical(projectDir))
+    : fallbackMemoryBase;
   const memoryDir = adapterMemoryDir
     ? resolveAgainst(projectDir, adapterMemoryDir)
-    : join(effectiveConfigDir, "memory");
+    : fallbackMemoryDir;
 
   // Collect candidate files
   const candidates: Array<{ path: string; label: string }> = [];

@@ -122,12 +122,38 @@ export interface MCPCallResult {
   isError?: boolean;
 }
 
+// Bridge-imposed timeout for protocol-handshake methods (initialize,
+// tools/list). These MUST be bounded: a server that never replies to
+// initialize would otherwise block Pi's bridge bootstrap indefinitely.
+// `tools/call` deliberately has NO bridge ceiling (#643) — long-running
+// ctx_execute (test suites, builds, cargo test) was rejected by a 120s
+// hardcoded bound even though the executor child would have finished.
+// Responsibility for bounding a tool call belongs to the executor
+// layer (per-tool timeout / background mode / Pi-level cancel), not
+// to the transport.
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
-// Tools/call may run shell commands or fetch URLs — wider window than
-// initialize/list, but still bounded so a hung server can't block Pi.
-const DEFAULT_CALL_TIMEOUT_MS = 120_000;
 
-class PiTextComponent {
+// Retry budget for the bridge bootstrap `initialize` handshake (#647).
+//
+// On cold NFS home dirs, first JIT compile of server.bundle.mjs, or
+// constrained CI runners, the first `initialize` can exceed the 60s
+// ceiling above. Before this fix, bootstrapMCPTools propagated the
+// rejection up to extension.ts, which logged once and continued with
+// NO ctx_* tools registered — silently degrading the session for its
+// entire lifetime while the routing block kept emitting ~2.5K tokens
+// of dead instructions per turn.
+//
+// Retry pattern mirrors the existing #583 single-flight respawn shape:
+// on failure, shut the prior child cleanly, sleep a short backoff so
+// the OS reclaims fds, then start + initialize again. After the budget
+// is exhausted we re-throw and the existing extension.ts handler runs
+// the degrade-and-log path — preserving the contract for genuinely
+// broken servers (binary missing, runtime crash, etc.) while
+// self-healing the transient warm-up case.
+const MAX_INIT_RETRIES = 2;
+const INIT_RETRY_DELAY_MS = 1_000;
+
+export class PiTextComponent {
   private text: string;
 
   constructor(text = "") {
@@ -151,27 +177,137 @@ class PiTextComponent {
   }
 }
 
-const ANSI_PATTERN = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
-function truncateAnsiLine(line: string, maxWidth: number): string {
+function extractTerminalEscape(str: string, pos: number): { code: string; length: number } | null {
+  if (pos >= str.length || str[pos] !== "\x1b") return null;
+  const next = str[pos + 1];
+
+  // CSI sequence: ESC [ ... final-byte. Covers SGR plus cursor/control codes.
+  if (next === "[") {
+    let j = pos + 2;
+    while (j < str.length) {
+      const code = str.charCodeAt(j);
+      if (code >= 0x40 && code <= 0x7e) {
+        return { code: str.slice(pos, j + 1), length: j + 1 - pos };
+      }
+      j++;
+    }
+    return null;
+  }
+
+  // OSC/APC sequence: ESC ]/_ ... BEL or ST (ESC \). Stop at the FIRST
+  // terminator so OSC 8 hyperlinks don't swallow visible link text.
+  if (next === "]" || next === "_") {
+    let j = pos + 2;
+    while (j < str.length) {
+      if (str[j] === "\x07") return { code: str.slice(pos, j + 1), length: j + 1 - pos };
+      if (str[j] === "\x1b" && str[j + 1] === "\\") {
+        return { code: str.slice(pos, j + 2), length: j + 2 - pos };
+      }
+      j++;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+function couldBeEmoji(segment: string): boolean {
+  const cp = segment.codePointAt(0) ?? 0;
+  return (
+    (cp >= 0x1f000 && cp <= 0x1fbff) ||
+    (cp >= 0x2300 && cp <= 0x23ff) ||
+    (cp >= 0x2600 && cp <= 0x27bf) ||
+    (cp >= 0x2b50 && cp <= 0x2b55) ||
+    segment.includes("\uFE0F") ||
+    segment.includes("\u200D")
+  );
+}
+
+function isZeroWidthCodePoint(cp: number): boolean {
+  return (
+    cp < 0x20 ||
+    (cp >= 0x7f && cp <= 0x9f) ||
+    (cp >= 0x300 && cp <= 0x36f) ||     // Combining Diacritical Marks
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||   // Combining Diacritical Marks Extended
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||   // Combining Diacritical Marks Supplement
+    (cp >= 0x20d0 && cp <= 0x20ff) ||   // Combining Diacritical Marks for Symbols
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||   // Variation Selectors
+    (cp >= 0xfe20 && cp <= 0xfe2f) ||   // Combining Half Marks
+    cp === 0x200b ||
+    cp === 0x200c ||
+    cp === 0x200d ||
+    cp === 0xfeff
+  );
+}
+
+function isZeroWidthGrapheme(segment: string): boolean {
+  if (segment.length === 0) return true;
+  for (const char of segment) {
+    if (!isZeroWidthCodePoint(char.codePointAt(0) ?? 0)) return false;
+  }
+  return true;
+}
+
+/**
+ * Returns the terminal display width of a code point.
+ * CJK ideographs, Hangul, fullwidth forms, etc. → 2; everything else → 1.
+ * Mirrors the Unicode east-asian-width "W"/"F" categories.
+ */
+function charWidth(cp: number): number {
+  return cp >= 0x1100 && (
+    cp <= 0x115f ||   // Hangul Jamo
+    (cp >= 0xa960 && cp <= 0xa97c) ||   // Hangul Jamo Extended-A
+    cp === 0x2329 || cp === 0x232a ||
+    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||  // CJK
+    (cp >= 0xac00 && cp <= 0xd7a3) ||   // Hangul syllables
+    (cp >= 0xd7b0 && cp <= 0xd7fb) ||   // Hangul Jamo Extended-B
+    (cp >= 0xf900 && cp <= 0xfaff) ||   // CJK compat
+    (cp >= 0xfe10 && cp <= 0xfe19) ||   // Vertical forms
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||   // CJK compat forms
+    (cp >= 0xff01 && cp <= 0xff60) ||   // Fullwidth forms
+    (cp >= 0xffe0 && cp <= 0xffe6) ||   // Fullwidth signs
+    (cp >= 0x20000 && cp <= 0x2fffd) || // CJK extensions
+    (cp >= 0x30000 && cp <= 0x3fffd)    // CJK extensions B+
+  ) ? 2 : 1;
+}
+
+function graphemeWidth(segment: string): number {
+  const cp = segment.codePointAt(0);
+  if (cp === undefined) return 0;
+  if (isZeroWidthGrapheme(segment)) return 0;
+  if (couldBeEmoji(segment)) return 2;
+  // Regional indicator symbols render as wide emoji flags in Pi's TUI.
+  if (cp >= 0x1f1e6 && cp <= 0x1f1ff) return 2;
+  return charWidth(cp);
+}
+
+export function truncateAnsiLine(line: string, maxWidth: number): string {
   if (maxWidth <= 0) return "";
   let output = "";
   let visible = 0;
   let index = 0;
-  ANSI_PATTERN.lastIndex = 0;
-  for (;;) {
-    const match = ANSI_PATTERN.exec(line);
-    const end = match?.index ?? line.length;
-    const chunk = line.slice(index, end);
-    for (const char of chunk) {
-      if (visible >= maxWidth) return output;
-      output += char;
-      visible++;
+  while (index < line.length) {
+    const escape = extractTerminalEscape(line, index);
+    if (escape) {
+      output += escape.code;
+      index += escape.length;
+      continue;
     }
-    if (!match) return output;
-    output += match[0];
-    index = ANSI_PATTERN.lastIndex;
+
+    let end = index + 1;
+    while (end < line.length && !extractTerminalEscape(line, end)) end++;
+    const chunk = line.slice(index, end);
+    for (const { segment } of GRAPHEME_SEGMENTER.segment(chunk)) {
+      const w = graphemeWidth(segment);
+      if (visible + w > maxWidth) return output;
+      output += segment;
+      visible += w;
+    }
+    index = end;
   }
+  return output;
 }
 
 interface PiRenderTheme {
@@ -402,30 +538,86 @@ export class MCPStdioClient {
     if (!this.child) throw new Error("MCP client not started");
     const id = ++this.requestId;
     return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        if (!this.pending.has(id)) return;
-        this.pending.delete(id);
-        reject(new Error(`MCP request timeout after ${timeoutMs}ms: ${method}`));
-      }, timeoutMs);
+      // Gate the timer on a finite ms value so callers can pass
+      // `Number.POSITIVE_INFINITY` to mean "no bridge ceiling" (#643).
+      // Node coerces both `undefined` and `Infinity` to a 1ms delay
+      // (TimeoutOverflowWarning), so we can't just pass them through —
+      // we must skip the setTimeout entirely. tools/call uses this path
+      // because long-running ctx_execute must not be bounded here.
+      const timer = Number.isFinite(timeoutMs)
+        ? setTimeout(() => {
+            if (!this.pending.has(id)) return;
+            this.pending.delete(id);
+            reject(new Error(`MCP request timeout after ${timeoutMs}ms: ${method}`));
+          }, timeoutMs)
+        : null;
       this.pending.set(id, {
         resolve: (v) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           resolve(v as T);
         },
         reject: (e) => {
-          clearTimeout(timer);
+          if (timer) clearTimeout(timer);
           reject(e);
         },
       });
       const frame = JSON.stringify({ jsonrpc: "2.0", id, method, params });
-      this.child!.stdin?.write(frame + "\n");
+      const rejectWrite = (err: Error) => {
+        const handler = this.pending.get(id);
+        if (handler) {
+          this.pending.delete(id);
+          handler.reject(err);
+          return;
+        }
+        reject(err);
+      };
+      this.writeFrame(frame, rejectWrite);
     });
+  }
+
+  private writeFrame(frame: string, onError?: (err: Error) => void): boolean {
+    if (!this.child || this.exited) {
+      onError?.(new Error("MCP server exited"));
+      return false;
+    }
+
+    const stdin = this.child.stdin;
+    if (!stdin || stdin.destroyed || stdin.writableEnded || stdin.closed) {
+      this.onExit();
+      onError?.(new Error("MCP server stdin unavailable"));
+      return false;
+    }
+
+    try {
+      stdin.write(frame + "\n", (err) => {
+        if (!err) return;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
+          this.onExit();
+          onError?.(err);
+          return;
+        }
+        onError?.(err);
+      });
+      return true;
+    } catch (err) {
+      const code =
+        err && typeof err === "object" && "code" in err
+          ? (err as NodeJS.ErrnoException).code
+          : undefined;
+      if (err instanceof Error && (code === "EPIPE" || code === "ERR_STREAM_DESTROYED")) {
+        this.onExit();
+        onError?.(err);
+        return false;
+      }
+      throw err;
+    }
   }
 
   notify(method: string, params: unknown): void {
     if (!this.child) return;
     const frame = JSON.stringify({ jsonrpc: "2.0", method, params });
-    this.child.stdin?.write(frame + "\n");
+    this.writeFrame(frame);
   }
 
   async initialize(): Promise<void> {
@@ -453,15 +645,23 @@ export class MCPStdioClient {
     // one layer covers `listTools` / `initialize` paths too, with a
     // single-flight guard against orphan child processes from
     // concurrent callers.
+    //
+    // No bridge-imposed timeout for tools/call (#643). The previous
+    // 120s ceiling rejected legitimate long-running ctx_execute calls
+    // (test suites, builds, large `cargo test`) even though the
+    // executor child would have finished. Bounding belongs to the
+    // executor layer (per-tool timeout / background mode / Pi cancel),
+    // not the transport. `Number.POSITIVE_INFINITY` instructs
+    // `request()` to skip the setTimeout entirely — see the gate there.
     return this.request<MCPCallResult>(
       "tools/call",
       { name, arguments: args ?? {} },
-      DEFAULT_CALL_TIMEOUT_MS,
+      Number.POSITIVE_INFINITY,
     );
   }
 
   /**
-   * Respawn the MCP child after an exit (clean idle shutdown or crash).
+   * Respawn the MCP child after an exit (clean shutdown or crash).
    * Resets state so a fresh `start()` + `initialize()` cycle runs, then
    * the caller's pending request flows through the new child.
    *
@@ -629,8 +829,45 @@ export async function bootstrapMCPTools(
   }
 
   const client = new MCPStdioClient(serverScript, env, runtime);
-  client.start();
-  await client.initialize();
+
+  // Retry-on-slow-initialize (#647).
+  //
+  // Each attempt is independently bounded by DEFAULT_REQUEST_TIMEOUT_MS
+  // (60s) inside request(). On failure we shutdown the child to release
+  // its fds before respawning — this is the same sequencing the #583
+  // respawn path uses, just hoisted into the bootstrap layer where the
+  // failure happens before any tool was registered. Final attempt's
+  // rejection is re-thrown so extension.ts's existing then/onRejected
+  // handler runs the degrade-and-log path for genuinely broken servers.
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= MAX_INIT_RETRIES; attempt++) {
+    try {
+      client.start();
+      await client.initialize();
+      lastError = undefined;
+      break;
+    } catch (err) {
+      lastError = err;
+      if (attempt === MAX_INIT_RETRIES) break;
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(
+        `[context-mode] WARNING: MCP bridge initialize failed ` +
+          `(attempt ${attempt + 1}/${MAX_INIT_RETRIES + 1}): ${msg}. Retrying…\n`,
+      );
+      // Reclaim the failed child's fds before respawning. shutdown() is
+      // idempotent and bounded by a 5s SIGKILL fallback (#472 round-3),
+      // so a child stuck in an uninterruptible syscall cannot block the
+      // retry loop indefinitely.
+      try {
+        client.shutdown();
+      } catch {
+        // best effort — we are already on the failure path
+      }
+      await new Promise((resolve) => setTimeout(resolve, INIT_RETRY_DELAY_MS));
+    }
+  }
+  if (lastError !== undefined) throw lastError;
+
   const tools = await client.listTools();
   const registered: string[] = [];
 

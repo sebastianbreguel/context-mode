@@ -11,7 +11,9 @@ import "./setup-home";
 import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from "vitest";
 import { mkdtempSync, rmSync, existsSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 
 // ── Test helpers ──────────────────────────────────────────
 
@@ -81,6 +83,304 @@ describe("ContextModePlugin", () => {
       expect(typeof plugin["experimental.session.compacting"]).toBe("function");
       expect(typeof plugin["experimental.chat.system.transform"]).toBe("function");
       expect(typeof plugin["chat.message"]).toBe("function");
+    });
+
+    it("registers all ctx_* tools natively via the plugin tool map (#574)", async () => {
+      const plugin = await createTestPlugin(join(tempDir, "factory-native-tools"));
+      expect(plugin).toHaveProperty("tool");
+      expect(Object.keys(plugin.tool ?? {}).sort()).toEqual([
+        "ctx_batch_execute",
+        "ctx_doctor",
+        "ctx_execute",
+        "ctx_execute_file",
+        "ctx_fetch_and_index",
+        "ctx_index",
+        "ctx_insight",
+        "ctx_purge",
+        "ctx_search",
+        "ctx_stats",
+        "ctx_upgrade",
+      ]);
+    });
+
+    it("converts tool args to Zod v4 when platform is kilo (#_zod.def fix)", async () => {
+      const prevKiloPid = process.env.KILO_PID;
+      process.env.KILO_PID = String(process.pid);
+      try {
+        const plugin = await createTestPlugin(join(tempDir, "kilo-zod-v4-args"));
+        expect(plugin).toHaveProperty("tool");
+        expect(Object.keys(plugin.tool ?? {}).length).toBeGreaterThan(0);
+
+        for (const [toolName, toolDef] of Object.entries(plugin.tool ?? {})) {
+          const args = (toolDef as any).args as Record<string, unknown>;
+          for (const [argName, argSchema] of Object.entries(args)) {
+            expect(
+              (argSchema as any)._zod,
+              `tool ${toolName} arg ${argName} missing _zod (Zod v4 marker)`,
+            ).toBeDefined();
+          }
+        }
+      } finally {
+        if (prevKiloPid !== undefined) process.env.KILO_PID = prevKiloPid;
+        else delete process.env.KILO_PID;
+      }
+    });
+
+    it("ctx_stats native plugin tool executes without an MCP child (#574 smoke)", async () => {
+      const projectDir = join(tempDir, "factory-native-tool-exec");
+      const plugin = await createTestPlugin(projectDir);
+      const result = await plugin.tool!.ctx_stats.execute({}, {
+        sessionID: "session-native-tool",
+        messageID: "msg-native-tool",
+        agent: "test-agent",
+        directory: projectDir,
+        worktree: projectDir,
+        abort: new AbortController().signal,
+        metadata: () => {},
+        ask: (() => ({}) as any) as any,
+      });
+      const output = typeof result === "string" ? result : result.output;
+      expect(output).toContain("context-mode");
+    });
+
+    // ── #621: native plugin must run Zod preprocessing on args ────────
+    // OpenCode's plugin tool registry (refs/platforms/opencode/packages/
+    // opencode/src/tool/registry.ts:127) only uses the Zod schema as a
+    // boolean type guard via .safeParse(u).success — it passes RAW args
+    // to def.execute(). Our handlers in server.ts rely on
+    // z.preprocess(coerceCommandsArray|coerceJsonArray, …) to coerce
+    // JSON-string args back into arrays and to fill defaults. Before
+    // the fix, registered.handler(args ?? {}) ran without parsing,
+    // so commands could arrive as `undefined` or `"[...]"`, and the
+    // handler crashed with `commands.map is not a function`.
+    describe("#621/#627: native plugin runs Zod preprocessing on args", () => {
+      const baseCtx = (projectDir: string) => ({
+        sessionID: "issue-621-sess",
+        messageID: "issue-621-msg",
+        agent: "test-agent",
+        directory: projectDir,
+        worktree: projectDir,
+        abort: new AbortController().signal,
+        metadata: () => {},
+        ask: (() => ({}) as any) as any,
+      });
+
+      it("ctx_batch_execute accepts well-formed args without crashing", async () => {
+        const projectDir = join(tempDir, "issue-621-baseline");
+        const plugin = await createTestPlugin(projectDir);
+        const result = await plugin.tool!.ctx_batch_execute.execute(
+          {
+            commands: [
+              { label: "echo test", command: "echo issue621-baseline" },
+            ],
+            queries: ["issue621-baseline"],
+            concurrency: 1,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        // Should succeed (no "commands.map is not a function" error).
+        expect(output).toContain("Executed");
+      });
+
+      it("ctx_batch_execute coerces JSON-stringified commands array (#621)", async () => {
+        const projectDir = join(tempDir, "issue-621-json-string");
+        const plugin = await createTestPlugin(projectDir);
+        // Simulate OpenCode delivering JSON-stringified array — the
+        // coerceCommandsArray preprocessor must turn this back into an
+        // array via z.preprocess before the handler runs.
+        const result = await plugin.tool!.ctx_batch_execute.execute(
+          {
+            commands: JSON.stringify([
+              { label: "echo coerced", command: "echo issue621-coerced" },
+            ]) as unknown as Array<{ label: string; command: string }>,
+            queries: JSON.stringify(["issue621-coerced"]) as unknown as string[],
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        expect(output).toContain("Executed");
+      });
+
+      it("ctx_batch_execute coerces plain-string commands into {label,command} (#621)", async () => {
+        const projectDir = join(tempDir, "issue-621-string-cmds");
+        const plugin = await createTestPlugin(projectDir);
+        // coerceCommandsArray also lifts bare strings into {label,command}.
+        const result = await plugin.tool!.ctx_batch_execute.execute(
+          {
+            commands: ["echo issue621-string-cmd"] as unknown as Array<{
+              label: string;
+              command: string;
+            }>,
+            queries: ["issue621-string-cmd"],
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        expect(output).toContain("Executed");
+      });
+
+      it("ctx_batch_execute surfaces actionable error when commands is missing (#621)", async () => {
+        const projectDir = join(tempDir, "issue-621-missing-commands");
+        const plugin = await createTestPlugin(projectDir);
+        // Before the fix this crashed with "commands.map is not a function"
+        // — opaque, hard for the LLM to recover from. After the fix the
+        // Zod schema rejects the missing field with a clear error.
+        await expect(
+          plugin.tool!.ctx_batch_execute.execute(
+            { queries: ["whatever"] } as unknown as Record<string, unknown>,
+            baseCtx(projectDir),
+          ),
+        ).rejects.toThrow(/Invalid arguments for ctx_batch_execute/);
+      });
+
+      it("ctx_search coerces JSON-stringified queries array (#621)", async () => {
+        const projectDir = join(tempDir, "issue-621-search-coerce");
+        const plugin = await createTestPlugin(projectDir);
+        // ctx_search also uses z.preprocess(coerceJsonArray, …) on queries.
+        // Empty knowledge base is fine — we only assert the call returns
+        // without a TypeError (the original symptom).
+        const result = await plugin.tool!.ctx_search.execute(
+          {
+            queries: JSON.stringify(["issue621-search"]) as unknown as string[],
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        // Should not throw; output is a normal search response (possibly
+        // "No results" / guidance) but never the JS TypeError symptom.
+        expect(typeof output).toBe("string");
+      });
+
+      // ─────────────────────────────────────────────────────────
+      // #627: same root cause class as #621, but for primitive coercion.
+      // OpenCode's plugin host (and several LLM providers' tool-call JSON)
+      // stringifies *primitive* args too — limit:"4" instead of limit:4,
+      // background:"false" instead of background:false. v1.0.139 (#621)
+      // started running inputSchema.parse() on the native path, which made
+      // these mismatches visible as "Invalid arguments" errors. The fix is
+      // to use z.coerce.* on the schemas (mirrors what ctx_batch_execute's
+      // timeout/concurrency and ctx_fetch_and_index's concurrency already
+      // do), AND to widen coerceJsonArray to lift bare-string queries.
+      // ─────────────────────────────────────────────────────────
+
+      it("ctx_search accepts stringified limit (#627 exact reporter case)", async () => {
+        const projectDir = join(tempDir, "issue-627-limit-string");
+        const plugin = await createTestPlugin(projectDir);
+        // Reporter's exact call shape: queries arrives as JSON string AND
+        // limit arrives as a number-string. v1.0.140's plain z.number()
+        // rejects "4" with "Expected number, received string".
+        const result = await plugin.tool!.ctx_search.execute(
+          {
+            queries: JSON.stringify([
+              "HTML file mermaid rendering flowchart display issue",
+            ]) as unknown as string[],
+            limit: "4" as unknown as number,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        // Should NOT throw — z.coerce.number() turns "4" into 4 before
+        // the handler sees it; queries coercion turns the JSON string
+        // into an array. Output is a normal "no results yet" guidance.
+        expect(typeof output).toBe("string");
+      });
+
+      it("ctx_search lifts bare-string queries into single-element array (#627)", async () => {
+        const projectDir = join(tempDir, "issue-627-bare-query");
+        const plugin = await createTestPlugin(projectDir);
+        // Some LLM providers send a single query as a bare string rather
+        // than a JSON-stringified array. Without widening, coerceJsonArray
+        // returns the string unchanged → z.array(z.string()) rejects it.
+        const result = await plugin.tool!.ctx_search.execute(
+          {
+            queries: "single bare query" as unknown as string[],
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        expect(typeof output).toBe("string");
+      });
+
+      it("ctx_execute accepts stringified background boolean (#627)", async () => {
+        // The project dir must exist on disk: the shell pipeline spawns
+        // /bin/zsh with cwd=projectDir, and Node's spawn() returns ENOENT
+        // for the shell binary itself when cwd doesn't exist (misleading
+        // — /bin/zsh is fine). The other tests in this block don't notice
+        // because ctx_batch_execute catches per-cmd executor errors and
+        // still returns its "Executed ..." wrapper text.
+        const projectDir = join(tempDir, "issue-627-background-bool");
+        mkdirSync(projectDir, { recursive: true });
+        const plugin = await createTestPlugin(projectDir);
+        // background: z.boolean() rejects "false". z.coerce.boolean would
+        // coerce — but Boolean("false") is true. Instead we use a small
+        // preprocessor (coerceBoolean) that maps "true"/"false" literals
+        // back to booleans and leaves real booleans untouched.
+        const result = await plugin.tool!.ctx_execute.execute(
+          {
+            language: "shell",
+            code: "echo issue627-bg",
+            background: "false" as unknown as boolean,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        // Should run synchronously (background coerced to false) and emit
+        // the echoed line — never throw "Invalid arguments for ctx_execute".
+        expect(output).toContain("issue627-bg");
+      });
+
+      it("ctx_purge accepts stringified confirm boolean (#627)", async () => {
+        const projectDir = join(tempDir, "issue-627-purge-confirm");
+        const plugin = await createTestPlugin(projectDir);
+        // confirm: z.boolean() rejects "false". With the boolean coercion
+        // fix, "false" becomes false → ctx_purge returns "purge cancelled"
+        // (its documented refusal path) instead of throwing on validation.
+        const result = await plugin.tool!.ctx_purge.execute(
+          {
+            confirm: "false" as unknown as boolean,
+          },
+          baseCtx(projectDir),
+        );
+        const output = typeof result === "string" ? result : result.output;
+        expect(output).toMatch(/cancel/i);
+      });
+    });
+
+    it("native tool registry import does not leak process handlers or embedded env into OpenCode host", () => {
+      const childHome = mkdtempSync(join(tmpdir(), "opencode-plugin-side-effects-"));
+      try {
+        const tsx = resolve(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+        const pluginPath = pathToFileURL(resolve(process.cwd(), "src", "adapters", "opencode", "plugin.ts")).href;
+        const script = `
+          (async () => {
+          const { ContextModePlugin } = await import(${JSON.stringify(pluginPath)});
+          const before = {
+            unhandled: process.listenerCount("unhandledRejection"),
+            uncaught: process.listenerCount("uncaughtException"),
+          };
+          await ContextModePlugin({ directory: ${JSON.stringify(childHome)}, client: { app: { log: async () => {} } } });
+          const after = {
+            unhandled: process.listenerCount("unhandledRejection"),
+            uncaught: process.listenerCount("uncaughtException"),
+            embedded: process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS ?? null,
+          };
+          console.log(JSON.stringify({ before, after }));
+          })().catch((err) => { console.error(err); process.exit(1); });
+        `;
+        const run = spawnSync(process.execPath, [tsx, "-e", script], {
+          cwd: process.cwd(),
+          env: { ...process.env, HOME: childHome, USERPROFILE: childHome },
+          encoding: "utf-8",
+        });
+        expect(run.status, run.stderr).toBe(0);
+        const result = JSON.parse(run.stdout.trim());
+        expect(result.after.unhandled).toBe(result.before.unhandled);
+        expect(result.after.uncaught).toBe(result.before.uncaught);
+        expect(result.after.embedded).toBeNull();
+      } finally {
+        rmSync(childHome, { recursive: true, force: true });
+      }
     });
 
     it("does not write AGENTS.md routing instructions on startup", async () => {

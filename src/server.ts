@@ -8,6 +8,7 @@ import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
 import { request as httpsRequest } from "node:https";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { z } from "zod";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
@@ -28,7 +29,22 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
-import { hashProjectDirCanonical, hashProjectDirLegacy, resolveContentStorePath, resolveSessionDbPath, SessionDB } from "./session/db.js";
+import { charSafePrefix } from "./truncate.js";
+import {
+  describeStorageDirectorySource,
+  ensureWritableStorageDir,
+  formatStorageDirectoryError,
+  hashProjectDirCanonical,
+  hashProjectDirLegacy,
+  resolveContentStorePath,
+  resolveContentStorageDir,
+  resolveDefaultSessionDir,
+  resolveSessionDbPath,
+  resolveSessionStorageDir,
+  resolveStatsStorageDir,
+  SessionDB,
+  StorageDirectoryError,
+} from "./session/db.js";
 import { purgeSession } from "./session/purge.js";
 import {
   emitCacheHitEvent,
@@ -39,7 +55,6 @@ import { persistToolCallCounter, restoreSessionStats } from "./session/persist-t
 import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter, type PlatformId } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
-import { resolveCodexConfigDir } from "./adapters/codex/paths.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
 import { resolveProjectDir } from "./util/project-dir.js";
@@ -56,25 +71,278 @@ const VERSION: string = (() => {
   return "unknown";
 })();
 
-// Prevent silent server death from unhandled async errors
-process.on("unhandledRejection", (err) => {
-  process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
-});
-process.on("uncaughtException", (err) => {
-  process.stderr.write(`[context-mode] uncaughtException: ${err?.message ?? err}\n`);
-});
+// Prevent silent MCP server death from unhandled async errors.
+//
+// Guarded for plugin-native OpenCode/Kilo imports (#574): when server.js is
+// imported only to reuse the ctx_* tool registry, these handlers would become
+// process-wide OpenCode/Kilo host handlers. In Node, adding an
+// `uncaughtException` listener changes default crash behavior, so only the
+// standalone MCP process may install them.
+if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+  process.on("unhandledRejection", (err) => {
+    process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
+  });
+  process.on("uncaughtException", (err) => {
+    process.stderr.write(`[context-mode] uncaughtException: ${err?.message ?? err}\n`);
+  });
+}
 
 const runtimes = detectRuntimes();
 const available = getAvailableLanguages(runtimes);
-const server = new McpServer({
+export const server = new McpServer({
   name: "context-mode",
   version: VERSION,
 });
 
+export interface RegisteredCtxTool {
+  name: string;
+  config: Record<string, unknown>;
+  handler: (args: Record<string, unknown>) => Promise<unknown> | unknown;
+}
+
+export const REGISTERED_CTX_TOOLS: RegisteredCtxTool[] = [];
+
+export function shouldSuppressMcpToolsForNativePluginHost(
+  opts: { embedded?: string; platform?: PlatformId; settings?: Record<string, unknown> | null } = {},
+): boolean {
+  const embedded = opts.embedded ?? process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+  if (embedded === "1") return false;
+  const platform = opts.platform ?? detectPlatform().platform;
+  if (platform !== "opencode" && platform !== "kilo") return false;
+  const settings = opts.settings ?? readNativePluginHostSettings(platform);
+  return settingsHasContextModePlugin(settings) && settingsHasLegacyContextModeMcp(settings);
+}
+
+function stripJsonComments(str: string): string {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < str.length; i++) {
+    const c = str[i];
+    const next = str[i + 1];
+
+    if (inBlockComment) {
+      if (c === "*" && next === "/") {
+        inBlockComment = false;
+        i++;
+      }
+      continue;
+    }
+
+    if (escaped) {
+      out += c;
+      escaped = false;
+      continue;
+    }
+
+    if (c === "\\") {
+      out += c;
+      escaped = inString;
+      continue;
+    }
+
+    if (c === '"') {
+      inString = !inString;
+      out += c;
+      continue;
+    }
+
+    if (!inString && c === "/" && next === "/") {
+      while (i < str.length && str[i] !== "\n") i++;
+      if (i < str.length) out += "\n";
+      continue;
+    }
+
+    if (!inString && c === "/" && next === "*") {
+      inBlockComment = true;
+      i++;
+      continue;
+    }
+
+    out += c;
+  }
+
+  return out
+    .replace(/,(\s*[}\]])/g, "$1");
+}
+
+function readNativePluginHostSettings(platform: PlatformId): Record<string, unknown> | null {
+  const base = platform === "kilo" ? "kilo" : "opencode";
+  const paths = [
+    resolve(`${base}.json`),
+    resolve(`${base}.jsonc`),
+    resolve(`.${base}`, `${base}.json`),
+    resolve(`.${base}`, `${base}.jsonc`),
+    join(homedir(), ".config", base, `${base}.json`),
+    join(homedir(), ".config", base, `${base}.jsonc`),
+  ];
+  for (const p of paths) {
+    try {
+      if (!existsSync(p)) continue;
+      return JSON.parse(stripJsonComments(readFileSync(p, "utf8"))) as Record<string, unknown>;
+    } catch { /* try next config path */ }
+  }
+  return null;
+}
+
+function settingsHasContextModePlugin(settings: Record<string, unknown> | null | undefined): boolean {
+  const plugins = settings?.plugin;
+  return Array.isArray(plugins) && plugins.some((p) => typeof p === "string" && p.includes("context-mode"));
+}
+
+function settingsHasLegacyContextModeMcp(settings: Record<string, unknown> | null | undefined): boolean {
+  const mcp = settings?.mcp;
+  return !!(
+    mcp &&
+    typeof mcp === "object" &&
+    !Array.isArray(mcp) &&
+    Object.prototype.hasOwnProperty.call(mcp, "context-mode")
+  );
+}
+
+const suppressMcpToolsForNativePluginHost = shouldSuppressMcpToolsForNativePluginHost();
+
+/**
+ * Issue #623 — surface why ctx_* tools/list is empty on suppressed legacy MCP
+ * children. When a user upgrades OpenCode/Kilo from v1.0.136 → v1.0.137+ without
+ * running `context-mode upgrade`, their opencode.json still has BOTH the legacy
+ * mcp.context-mode block AND the plugin entry. The plugin path registers the
+ * tools natively, but the legacy MCP child runs in parallel and used to expose
+ * duplicate tools — v1.0.137 suppressed those duplicates. The suppression was
+ * silent, leaving any MCP client that inspected the child via tools/list with
+ * an empty list and no diagnostic. Emit one stderr line per process so an
+ * operator running the child directly (or any non-plugin MCP host) sees the
+ * exact reason and the `context-mode upgrade` fix.
+ *
+ * Exported for test (suppression-diagnostic regression guard).
+ */
+let __suppressionDiagnosticEmitted = false;
+export function emitSuppressionDiagnostic(
+  opts: { platform?: string; write?: (chunk: string) => void } = {},
+): void {
+  if (__suppressionDiagnosticEmitted) return;
+  __suppressionDiagnosticEmitted = true;
+  const write = opts.write ?? ((c: string) => { process.stderr.write(c); });
+  const platform = opts.platform ?? "opencode/kilo";
+  write(
+    `[context-mode] ctx_* tools/list intentionally empty on this MCP child: ` +
+    `legacy mcp.context-mode block coexists with plugin: ["context-mode"] in ` +
+    `${platform}.json — plugin-native tools are the supported path (#623). ` +
+    `Run \`context-mode upgrade\` to remove the legacy block (preserves other ` +
+    `MCP servers).\n`
+  );
+}
+/** Test-only: reset the one-shot emission flag so suites can re-exercise. */
+export function __resetSuppressionDiagnosticForTests(): void {
+  __suppressionDiagnosticEmitted = false;
+}
+
+/**
+ * Issue #637 — register an explicit empty `tools/list` handler on the McpServer.
+ *
+ * Background: when `suppressMcpToolsForNativePluginHost` is true, every
+ * `server.registerTool()` call is short-circuited (returns `undefined` above).
+ * The MCP SDK only installs the SDK-default `tools/list` handler when at least
+ * one `registerTool()` reaches `setToolRequestHandlers()` internally
+ * (mcp.js:56-67). Suppressing every registration leaves `tools/list`
+ * unregistered, and the framework's RPC layer answers it with
+ * `-32601 "Method not found"`.
+ *
+ * The reporter of #637 (SquirrelRat) inspected the suppressed child via
+ * `tools/list` and read the JSON-RPC error as "the plugin never registers any
+ * ctx_* tools" — when in fact the plugin DOES register all 11 tools natively
+ * (verified at `src/adapters/opencode/plugin.ts:469` and
+ * `tests/opencode-plugin.test.ts:88`). The misleading -32601 is the seed of
+ * the #637 perception.
+ *
+ * This helper installs an explicit handler that returns `{tools: []}` — a
+ * spec-compliant empty list. Paired with the existing #623 stderr diagnostic,
+ * an operator now sees:
+ *   - wire response: `{tools: []}` (matches expectation, no JSON-RPC error)
+ *   - stderr: `[context-mode] ctx_* tools/list intentionally empty… (#623)`
+ *
+ * Idempotent: throws inside SDK if called twice on the same server because
+ * `assertCanSetRequestHandler` (mcp.js:60) rejects duplicate registrations;
+ * we therefore install the SDK's default tool handlers FIRST (via a no-op
+ * registerTool of a fake tool, immediately removed) only if needed. To keep
+ * the public surface minimal, we just call `server.server.setRequestHandler`
+ * directly — that is the same low-level call used for prompts/resources at
+ * server.ts:259-261 and avoids the SDK guard entirely.
+ *
+ * Exported for test (#637 in-memory regression guard).
+ */
+export function registerEmptyToolsListHandler(target: McpServer = server): void {
+  target.server.registerCapabilities({ tools: { listChanged: false } });
+  target.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+}
+
+const originalRegisterTool = server.registerTool.bind(server);
+(server as unknown as { registerTool: (...args: unknown[]) => unknown }).registerTool = (...args: unknown[]) => {
+  const [name, config, handler] = args as [
+    string,
+    Record<string, unknown>,
+    (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
+  ];
+  if (suppressMcpToolsForNativePluginHost) {
+    emitSuppressionDiagnostic();
+    return undefined;
+  }
+  const wrappedHandler = wrapToolHandler(name, handler);
+  REGISTERED_CTX_TOOLS.push({ name, config, handler: wrappedHandler });
+  args[2] = wrappedHandler;
+  return (originalRegisterTool as unknown as (...callArgs: unknown[]) => unknown)(...args);
+};
+
+function wrapToolHandler(
+  name: string,
+  handler: (toolArgs: Record<string, unknown>) => Promise<unknown> | unknown,
+): (toolArgs: Record<string, unknown>) => Promise<unknown> {
+  return async (toolArgs: Record<string, unknown>) => {
+    try {
+      return await handler(toolArgs);
+    } catch (err) {
+      const result = storageErrorResult(err);
+      if (result) {
+        try {
+          return trackResponse(name, result);
+        } catch (trackErr) {
+          if (trackErr instanceof StorageDirectoryError) return result;
+          throw trackErr;
+        }
+      }
+      throw err;
+    }
+  };
+}
+
+// Issue #637 — when suppression is active, install the empty tools/list handler
+// once at module-init time so the suppressed MCP child responds with
+// `{tools: []}` instead of JSON-RPC `-32601 Method not found`. Pair with the
+// #623 stderr diagnostic that explains WHY the list is empty. Skipped for the
+// embedded plugin-import path because the embedded process is not the stdio
+// MCP child an operator would inspect — it lives inside the OpenCode/Kilo
+// host and never speaks JSON-RPC over stdio.
+if (suppressMcpToolsForNativePluginHost && process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+  registerEmptyToolsListHandler(server);
+}
+
+type ToolContextOverride = { projectDir: string; sessionId?: string };
+const projectDirOverride = new AsyncLocalStorage<ToolContextOverride>();
+
+export async function withProjectDirOverride<T>(
+  projectDir: string | ToolContextOverride,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const ctx = typeof projectDir === "string" ? { projectDir } : projectDir;
+  return projectDirOverride.run(ctx, fn);
+}
+
 // Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
 // OpenCode calls listPrompts()/listResources() unconditionally — the error can poison
 // the SDK transport layer, causing subsequent listTools() calls to fail permanently.
-import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 server.server.registerCapabilities({ prompts: { listChanged: false }, resources: { listChanged: false } });
 server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
 server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
@@ -96,6 +364,11 @@ writeFileSync(
   CM_FS_PRELOAD,
   `(function(){var __cm_fs=0;process.on('exit',function(){if(__cm_fs>0)try{process.stderr.write('__CM_FS__:'+__cm_fs+'\\n')}catch(e){}});try{var f=require('fs');var ors=f.readFileSync;f.readFileSync=function(){var r=ors.apply(this,arguments);if(Buffer.isBuffer(r))__cm_fs+=r.length;else if(typeof r==='string')__cm_fs+=Buffer.byteLength(r);return r;};}catch(e){}})();\n`,
 );
+// In the stdio MCP path, main() also removes this file during graceful
+// shutdown. Plugin-native OpenCode/Kilo imports skip main() (#574), so
+// register a top-level best-effort cleanup too to avoid leaking preload
+// snippets under /tmp when the host process exits.
+process.on("exit", () => { try { unlinkSync(CM_FS_PRELOAD); } catch { /* best effort */ } });
 
 // Lazy singleton — no DB overhead unless index/search is used
 let _store: ContentStore | null = null;
@@ -109,6 +382,9 @@ let _store: ContentStore | null = null;
  * legacy unattributed rows readable.
  */
 export function currentAttribution(): { sessionId?: string } | undefined {
+  const override = projectDirOverride.getStore();
+  if (override?.sessionId) return { sessionId: override.sessionId };
+
   // CLAUDE_SESSION_ID env var is NOT propagated to MCP servers (only to hooks).
   // Cross-adapter resolution: every adapter (15 of them) sets *_PROJECT_DIR env
   // and writes session_events via hooks. Read the most-recent session_id from
@@ -201,10 +477,6 @@ let _insightChild: ChildProcess | null = null;
  * Issue #460 round-3: delegates to the canonical util so empty/whitespace
  * env values fall back instead of poisoning downstream `join()` calls.
  */
-function resolveClaudeConfigRoot(): string {
-  return resolveClaudeConfigDir();
-}
-
 async function getDiagnosticAdapter(): Promise<HookAdapter | null> {
   if (_detectedAdapter) return _detectedAdapter;
   try {
@@ -220,7 +492,7 @@ async function getDiagnosticAdapter(): Promise<HookAdapter | null> {
  * Get the platform-specific sessions directory from the detected adapter.
  * Falls back to the detected platform config root before adapter detection.
  */
-function getSessionDir(): string {
+function getDefaultSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
   // Pre-detection path (race window before MCP `initialize` completes):
   // call detectPlatform() (sync, env-var-based) and look up segments via
@@ -232,20 +504,23 @@ function getSessionDir(): string {
     const signal = detectPlatform();
     const segments = getSessionDirSegments(signal.platform);
     if (segments) {
-      let root = join(homedir(), ...segments);
-      if (segments.length === 1 && segments[0] === ".claude") {
-        root = resolveClaudeConfigRoot();
-      } else if (segments.length === 1 && segments[0] === ".codex") {
-        root = resolveCodexConfigDir();
-      }
-      const dir = join(root, "context-mode", "sessions");
-      mkdirSync(dir, { recursive: true });
-      return dir;
+      return resolveDefaultSessionDir({
+        configDir: join(...segments),
+        configDirEnv: configDirEnvForSessionSegments(segments),
+      });
     }
   } catch { /* fall through to claude fallback */ }
-  const dir = join(resolveClaudeConfigRoot(), "context-mode", "sessions");
-  mkdirSync(dir, { recursive: true });
-  return dir;
+  return resolveDefaultSessionDir({ configDir: ".claude", configDirEnv: "CLAUDE_CONFIG_DIR" });
+}
+
+function configDirEnvForSessionSegments(segments: string[]): string | undefined {
+  if (segments.length === 1 && segments[0] === ".claude") return "CLAUDE_CONFIG_DIR";
+  if (segments.length === 1 && segments[0] === ".codex") return "CODEX_HOME";
+  return undefined;
+}
+
+function getSessionDir(): string {
+  return ensureWritableStorageDir(resolveSessionStorageDir(getDefaultSessionDir));
 }
 
 /**
@@ -259,7 +534,10 @@ function getSessionDir(): string {
  * CONTEXT_MODE_PROJECT_DIR guarantees correct projectDir even for platforms
  * that don't set their own env var (Cursor, OpenClaw, Codex, Kiro, Zed).
  */
-function getProjectDir(): string {
+export function getProjectDir(): string {
+  const override = projectDirOverride.getStore();
+  if (override) return override.projectDir;
+
   // Delegated to the shared resolver so the env-var chain rejects plugin
   // install paths (set by a prior MCP boot's start.mjs after `/ctx-upgrade`)
   // and prefers the shell-set PWD before the chdir'd cwd. v1.0.115 adds
@@ -291,13 +569,21 @@ function getProjectDir(): string {
   // and the legacy literal cascade is preserved there for semver safety.
   let transcriptsRoot: string | undefined;
   let strictPlatform: PlatformId | undefined;
+  let codexHome: string | undefined;
   try {
     const detected = detectPlatform().platform;
     strictPlatform = detected;
     if (detected === "claude-code") {
       transcriptsRoot = join(homedir(), ".claude", "projects");
     }
-  } catch { /* detection failure — leave both undefined, resolver uses legacy cascade */ }
+    // Issue #45 — Codex publishes no workspace env var, so the resolver
+    // reads `meta.cwd` from the most-recently-modified session.jsonl under
+    // `${codexHome}/sessions/`. Wire codexHome at the call site so the
+    // resolver can be exercised under test without process-level mutation.
+    if (detected === "codex") {
+      codexHome = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+    }
+  } catch { /* detection failure — leave undefined, resolver uses legacy cascade */ }
   return resolveProjectDir({
     env: process.env,
     cwd: process.cwd(),
@@ -305,6 +591,7 @@ function getProjectDir(): string {
     transcriptsRoot,
     transcriptMaxAgeMs: 5 * 60 * 1000,
     strictPlatform,
+    codexHome,
   });
 }
 
@@ -341,9 +628,7 @@ function getSessionDbPath(): string {
  *         ~/.cursor/context-mode/content/87c28c41ddb64d38.db
  */
 function getStorePath(): string {
-  // Derive content dir from session dir: .../sessions/ → .../content/
-  const dir = join(dirname(getSessionDir()), "content");
-  mkdirSync(dir, { recursive: true });
+  const dir = ensureWritableStorageDir(resolveContentStorageDir(getDefaultSessionDir));
   // Delegate to resolveContentStorePath: same case-fold + one-shot legacy
   // rename behavior as resolveSessionDbPath. On macOS / Windows, an
   // existing legacy raw-casing FTS5 db (with -wal/-shm sidecars) is
@@ -414,6 +699,13 @@ type ToolResult = {
   isError?: boolean;
 };
 
+function storageErrorResult(err: unknown): ToolResult | null {
+  if (!(err instanceof StorageDirectoryError)) return null;
+  return {
+    content: [{ type: "text", text: formatStorageDirectoryError(err) }],
+    isError: true,
+  };
+}
 // ── Version outdated warning ──────────────────────────────────────────────
 // Non-blocking npm check at startup. trackResponse prepends warning
 // using a burst cadence: 3 warnings → 1h silent → 3 warnings → repeat.
@@ -621,7 +913,8 @@ let _lifetimeCache: { tokens: number; computedAt: number } | undefined;
  */
 function getStatsFilePath(): string {
   const sessionId = process.env.CLAUDE_SESSION_ID || `pid-${process.ppid}`;
-  return join(getSessionDir(), `stats-${sessionId}.json`);
+  const statsDir = ensureWritableStorageDir(resolveStatsStorageDir(getDefaultSessionDir));
+  return join(statsDir, `stats-${sessionId}.json`);
 }
 
 function persistStats(): void {
@@ -1028,6 +1321,14 @@ function formatCommandOutput(label: string, raw: string, onFsBytes?: (bytes: num
   return `# ${label}\n\n${output}\n`;
 }
 
+function combineExecOutput(result: { stdout?: string; stderr?: string }): string {
+  const stdout = result.stdout || "";
+  const stderr = result.stderr || "";
+  if (!stderr) return stdout;
+  if (!stdout) return stderr;
+  return `${stdout}${stdout.endsWith("\n") ? "" : "\n"}${stderr}`;
+}
+
 /**
  * Execute batch commands. concurrency=1 preserves the legacy serial path
  * (shared timeout budget + cascading skip-on-timeout). concurrency>1 runs
@@ -1064,10 +1365,10 @@ export async function runBatchCommands(
       }
       const result = await executor.execute({
         language: "shell",
-        code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
+        code: `${nodeOptsPrefix}${cmd.command}`,
         timeout: perCmdTimeout,
       });
-      outputs.push(formatCommandOutput(cmd.label, result.stdout, onFsBytes));
+      outputs.push(formatCommandOutput(cmd.label, combineExecOutput(result), onFsBytes));
       if (result.timedOut) {
         timedOut = true;
         for (let j = i + 1; j < commands.length; j++) {
@@ -1086,12 +1387,12 @@ export async function runBatchCommands(
     run: async () => {
       const result = await executor.execute({
         language: "shell",
-        code: `${nodeOptsPrefix}${cmd.command} 2>&1`,
+        code: `${nodeOptsPrefix}${cmd.command}`,
         timeout,
       });
-      // Always route partial stdout through formatCommandOutput so __CM_FS__
+      // Always route partial output through formatCommandOutput so __CM_FS__
       // markers are stripped + counted, even when the command timed out.
-      const formatted = formatCommandOutput(cmd.label, result.stdout, onFsBytes);
+      const formatted = formatCommandOutput(cmd.label, combineExecOutput(result), onFsBytes);
       const output = result.timedOut
         ? formatted.replace(/\n$/, "") + `\n(timed out after ${timeout ?? "?"}ms)\n`
         : formatted;
@@ -1124,7 +1425,38 @@ server.registerTool(
   "ctx_execute",
   {
     title: "Execute Code",
-    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.`,
+    description: `Run code in a sandboxed subprocess.${bunNote} Languages: ${langList}.
+
+Think-in-Code — the core philosophy: the bytes your code processes never enter your conversation memory; only what you console.log() does. Reading a 700 KB log directly means 700 KB of your remaining reasoning capacity gets spent on raw bytes. Running code over that same log in this sandbox and printing a 3 KB summary leaves you with 697 KB of capacity for the actual work.
+
+Concrete shape — analyze 47 source files without reading any of them:
+  ctx_execute(language: "javascript", code: \`
+    const fs = require('fs');
+    const files = fs.readdirSync('src').filter(f => f.endsWith('.ts'));
+    files.forEach(f => {
+      const lines = fs.readFileSync('src/'+f,'utf8').split('\\\\n').length;
+      console.log(f + ': ' + lines + ' lines');
+    });
+  \`)
+  // 47 files analyzed, 15,314 LoC summarized — output ~3.6 KB instead of 47 Read() calls = ~700 KB.
+
+WHEN:
+  - You intend to derive an answer FROM data (filter, count, aggregate, parse, compare, transform) — do the derivation in code and print only the answer
+  - Output shape or size cannot be predicted before execution (recursive finds, repo-wide greps, list endpoints, query results, log scans)
+  - You would otherwise read raw output and then mentally compute — that compute belongs here, in code, where its inputs stay out of your conversation
+  - You need to keep a long-running process alive (dev server, watcher, daemon) — pass \`background: true\` to detach on timeout instead of killing the process
+  - The output may legitimately be large but you only want recall-by-topic later — pass an \`intent\` string; outputs over ~5KB are auto-indexed into the knowledge base and only the section titles + previews come back, retrievable via ctx_search
+
+WHEN NOT:
+  - Single observational command whose entire short output you intend to consume verbatim (whoami, pwd, git status on a clean tree) — Bash is simpler
+  - File mutations (Edit/Write) or navigation (cd/ls) — Bash is the right surface
+  - You already know the output is one short fixed line and you want to read it as-is
+
+RETURNS:
+  Only what your code prints. Wrap risky calls in try/catch — uncaught errors go to stderr and may leak more than intended. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout; use ctx_search(queries: [...]) to drill into specific sections.
+
+EXAMPLE: ctx_execute(language: "shell", code: "npm test 2>&1 | grep -E '(FAIL|✗|×|Error:|Tests +.*(failed|passed))' | head -60")
+EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('gh issue list --json number,title --limit 100', {encoding:'utf8'}); const hooks = JSON.parse(out).filter(i => /hook|routing/i.test(i.title)); console.log(\`\${hooks.length} hook-related issues\`)")`,
     inputSchema: z.object({
       language: z
         .enum([
@@ -1151,8 +1483,13 @@ server.registerTool(
         .coerce.number()
         .optional()
         .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs (which is the right layer for this policy). Pass an explicit value for long-running builds (Gradle/Maven/SBT)."),
+      // background: wrapped in coerceBoolean preprocessor so the literal
+      // strings "true"/"false" arriving from OpenCode's native plugin
+      // bridge (and several LLM providers' tool-call JSON) parse as the
+      // boolean the handler expects. z.coerce.boolean() is unsafe here —
+      // Boolean("false") is true. Fixes #627.
       background: z
-        .boolean()
+        .preprocess(coerceBoolean, z.boolean())
         .optional()
         .default(false)
         .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE ctx_execute call instead of using background."),
@@ -1454,8 +1791,26 @@ server.registerTool(
   "ctx_execute_file",
   {
     title: "Execute File Processing",
-    description:
-      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.",
+    description: `Read a file into a sandboxed FILE_CONTENT variable and run code over it. Only what you console.log() enters your conversation — the file bytes stay in the sandbox.
+
+Think-in-Code applied to file-level analysis: Reading the whole file means every byte enters your conversation memory and costs reasoning capacity for the rest of the session. Running code over it here lets you keep the raw bytes out and only the derived answer in. Same principle as ctx_execute, scoped to one named file via the FILE_CONTENT variable.
+
+WHEN:
+  - You want to KNOW SOMETHING ABOUT a file (line count, matches of a pattern, parsed structure, statistical aggregate) without needing to SEE all of it
+  - The file is structured (CSV, JSON, log, code) and a code-level derivation is cheaper than reading verbatim
+  - The file is large enough that reading the full content would burn meaningful conversation memory you need for the actual work
+  - The derivation may itself produce a large output you want recall-by-topic on later — pass an \`intent\` string; outputs over ~5KB are auto-indexed and only matching sections come back, retrievable via ctx_search
+
+WHEN NOT:
+  - You intend to EDIT the file — use Read so the subsequent Edit can match the exact text
+  - You only need one specific line and you know its offset — Read with offset/limit is the simplest path
+  - The file is small AND you will consume all of it for understanding/editing — Read directly
+
+RETURNS:
+  Only what your code prints. The FILE_CONTENT variable holds the raw bytes inside the sandbox; nothing else leaves. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout.
+
+EXAMPLE: ctx_execute_file(path: "huge.log", language: "javascript", code: "const errs = FILE_CONTENT.split('\\\\n').filter(l => /ERROR|FATAL/.test(l)); console.log(\`\${errs.length} error lines\`); console.log(errs.slice(-5).join('\\\\n'))")
+EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const rows = FILE_CONTENT.split('\\\\n'); console.log(\`rows: \${rows.length - 1}, header: \${rows[0]}\`)")`,
     inputSchema: z.object({
       path: z
         .string()
@@ -1600,20 +1955,25 @@ server.registerTool(
   "ctx_index",
   {
     title: "Index Content",
-    description:
-      "Index documentation or knowledge content into a searchable BM25 knowledge base. " +
-      "Chunks markdown by headings (keeping code blocks intact) and stores in ephemeral FTS5 database. " +
-      "The full content does NOT stay in context — only a brief summary is returned.\n\n" +
-      "WHEN TO USE:\n" +
-      "- Documentation from Context7, Skills, or MCP tools (API docs, framework guides, code examples)\n" +
-      "- API references (endpoint details, parameter specs, response schemas)\n" +
-      "- MCP tools/list output (exact tool signatures and descriptions)\n" +
-      "- Skill prompts and instructions that are too large for context\n" +
-      "- README files, migration guides, changelog entries\n" +
-      "- Any content with code examples you may need to reference precisely\n\n" +
-      "After indexing, use 'ctx_search' to retrieve specific sections on-demand.\n" +
-      "When `path` is provided, a content hash is stored for automatic stale detection in search results.\n" +
-      "Do NOT use for: log files, test output, CSV, build output — use 'ctx_execute_file' for those.",
+    description: `Store content in a searchable knowledge base (BM25 over FTS5). Splits markdown by headings, keeps code blocks intact, and persists the raw chunks. The full content stays in storage — retrieve any section on-demand via ctx_search; nothing is summarized or truncated.
+
+WHEN:
+  - Documentation from Context7, Skills, or MCP tools (API docs, framework guides, code examples)
+  - API references (endpoint details, parameter specs, response schemas)
+  - MCP tools/list output (exact tool signatures and descriptions)
+  - Skill prompts and instructions that are too large to keep verbatim in conversation
+  - README files, migration guides, changelog entries
+  - Any content with code examples you may need to reference precisely later
+
+WHEN NOT:
+  - Log files, test output, CSV, or build output — use ctx_execute_file, which processes in-sandbox without persisting bytes
+  - Single-use ephemeral content you will not query later — keep it inline if it fits, or ctx_execute_file it
+
+RETURNS:
+  Indexing metadata: chunk counts (total, code-bearing), source label, and the exact ctx_search call shape to query the indexed content. Raw content is NOT echoed back — it lives in storage, retrievable via ctx_search(source: "<label>"). When \`path\` is provided, a content hash is stored so ctx_search results auto-flag staleness on future calls.
+
+EXAMPLE: ctx_index(content: "# React useEffect\\n\\nThe Effect Hook lets you ...", source: "react-useeffect-docs")
+EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
     inputSchema: z.object({
       content: z
         .string()
@@ -1625,7 +1985,7 @@ server.registerTool(
         .string()
         .optional()
         .describe(
-          "File path to read and index (content never enters context). Provide this OR content.",
+          "File OR directory path to read and index (content never enters context). Provide this OR content. Directory paths trigger a bounded recursive walk (#687).",
         ),
       source: z
         .string()
@@ -1633,9 +1993,30 @@ server.registerTool(
         .describe(
           "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
         ),
+      include: z.array(z.string()).optional().describe(
+        "Directory-only: glob patterns to include (default: all matching extensions).",
+      ),
+      exclude: z.array(z.string()).optional().describe(
+        "Directory-only: glob patterns to exclude. Merged with defaults (node_modules, .git, dist, build, .next, coverage, .venv, __pycache__, .DS_Store).",
+      ),
+      maxDepth: z.number().int().min(0).optional().describe(
+        "Directory-only: max recursion depth from root (default: 5).",
+      ),
+      maxFiles: z.number().int().min(1).optional().describe(
+        "Directory-only: hard cap on files indexed (default: 200) — FTS5 blow-up guard.",
+      ),
+      extensions: z.array(z.string()).optional().describe(
+        "Directory-only: allowed file extensions (default: .md .mdx .txt .json .yaml .yml .ts .tsx .js .jsx .py .rs .go .sh).",
+      ),
+      respectGitignore: z.boolean().optional().describe(
+        "Directory-only: apply nearest .gitignore (default: true).",
+      ),
+      followSymlinks: z.boolean().optional().describe(
+        "Directory-only: follow directory symlinks (default: false — cycle hazard + escape risk).",
+      ),
     }),
   },
-  async ({ content, path, source }) => {
+  async ({ content, path, source, include, exclude, maxDepth, maxFiles, extensions, respectGitignore, followSymlinks }) => {
     if (!content && !path) {
       return trackResponse("ctx_index", {
         content: [
@@ -1659,6 +2040,55 @@ server.registerTool(
 
     try {
       const resolvedPath = path ? resolveProjectPath(path) : undefined;
+
+      // Directory dispatch (#687, reported by @matiasduartee). When the
+      // resolved path is a directory, walk it bounded and re-enter `index()`
+      // per-file so the security gate at store.ts:845 (TOCTOU defense from
+      // #442 round-3) keeps running for every file.
+      if (resolvedPath && existsSync(resolvedPath) && statSync(resolvedPath).isDirectory()) {
+        const store = getStore();
+        const projectDir = getProjectDir();
+        const denyGlobs = readToolDenyPatterns("Read", projectDir);
+        const isWin32 = process.platform === "win32";
+        const perFileDeny = (absPath: string): boolean => {
+          try {
+            return evaluateFilePath(absPath, denyGlobs, isWin32, projectDir).denied;
+          } catch {
+            return false; // fail-open consistent with checkFilePathDenyPolicy
+          }
+        };
+        const dirResult = store.indexDirectory({
+          path: resolvedPath,
+          source: source ?? resolvedPath,
+          attribution: currentAttribution(),
+          perFileDeny,
+          include,
+          exclude,
+          maxDepth,
+          maxFiles,
+          extensions,
+          respectGitignore,
+          followSymlinks,
+        });
+        const capNote = dirResult.capped
+          ? ` (cap reached — only first ${dirResult.filesIndexed} of ${dirResult.totalSeen}+ files; raise maxFiles to index more)`
+          : "";
+        const denyNote = dirResult.denied > 0
+          ? ` (${dirResult.denied} file${dirResult.denied === 1 ? "" : "s"} blocked by Read deny policy)`
+          : "";
+        const failNote = dirResult.failed > 0
+          ? ` (${dirResult.failed} file${dirResult.failed === 1 ? "" : "s"} failed to read)`
+          : "";
+        return trackResponse("ctx_index", {
+          content: [
+            {
+              type: "text" as const,
+              text: `Indexed ${dirResult.filesIndexed} file${dirResult.filesIndexed === 1 ? "" : "s"} (${dirResult.totalChunks} sections) from directory: ${dirResult.label}${capNote}${denyNote}${failNote}\nUse ctx_search(queries: ["..."]) to query this content.`,
+            },
+          ],
+        });
+      }
+
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
       else if (resolvedPath) {
@@ -1702,17 +2132,53 @@ const SEARCH_MAX_RESULTS_AFTER = 3; // after 3 calls: 1 result per query
 const SEARCH_BLOCK_AFTER = 8; // after 8 calls: refuse, demand batching
 
 /**
- * Defensive coercion: parse stringified JSON arrays.
- * Works around Claude Code double-serialization bug where array params
- * are sent as JSON strings (e.g. "[\"a\",\"b\"]" instead of ["a","b"]).
- * See: https://github.com/anthropics/claude-code/issues/34520
+ * Defensive coercion: parse stringified JSON arrays, AND lift a bare
+ * non-empty string into a single-element array.
+ *
+ * Two shapes show up from the wild:
+ *   1. `"[\"a\",\"b\"]"` — Claude Code double-serialization bug
+ *      (https://github.com/anthropics/claude-code/issues/34520).
+ *   2. `"single query"` — some LLM providers / OpenCode's native plugin
+ *      bridge deliver a single string when the schema expects `string[]`
+ *      (issue #627). v1.0.139 (#621) made the bridge run the Zod schema,
+ *      so this now surfaces as `Expected array, received string`. The
+ *      ergonomic recovery is to treat it as `["single query"]`.
+ *
+ * An empty string is intentionally NOT lifted — empty input should still
+ * fail Zod's `.min(1)` check rather than masquerade as `[""]`.
  */
 function coerceJsonArray(val: unknown): unknown {
   if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed.length === 0) return val; // let zod produce "non-empty" error
     try {
       const parsed = JSON.parse(val);
       if (Array.isArray(parsed)) return parsed;
-    } catch { /* not valid JSON, let zod handle the error */ }
+    } catch { /* fall through — not JSON, treat as bare-string lift */ }
+    // Bare-string lift (#627): single query delivered as a plain string.
+    return [val];
+  }
+  return val;
+}
+
+/**
+ * Defensive coercion: accept the string literals "true"/"false" as
+ * booleans. The OpenCode native plugin bridge (and several LLM providers'
+ * tool-call JSON) stringifies primitives — `background:"false"` instead
+ * of `background:false`, `confirm:"true"` instead of `confirm:true`.
+ *
+ * We deliberately do NOT use `z.coerce.boolean()` for boolean fields:
+ * `Boolean("false")` is `true`, so Zod's coerce path silently flips the
+ * meaning. This helper recognises only the documented literal forms and
+ * passes anything else through untouched so Zod surfaces the right error.
+ *
+ * Fixes #627.
+ */
+function coerceBoolean(val: unknown): unknown {
+  if (typeof val === "string") {
+    const t = val.trim().toLowerCase();
+    if (t === "true") return true;
+    if (t === "false") return false;
   }
   return val;
 }
@@ -1735,19 +2201,43 @@ server.registerTool(
   "ctx_search",
   {
     title: "Search Indexed Content",
-    description:
-      "Search indexed content. Requires prior indexing via ctx_batch_execute, ctx_index, or ctx_fetch_and_index. " +
-      "Pass ALL search questions as queries array in ONE call. " +
-      "File-backed sources are auto-refreshed when the source file changes.\n\n" +
-      "TIPS: 2-4 specific terms per query. Use 'source' to scope results.\n\n" +
-      "SESSION STATE: If skills, roles, or decisions were set earlier in this conversation, they are still active. Do not discard or contradict them.",
+    description: `Search a unified knowledge base with a multi-strategy ranking pipeline. Two parallel matchers run on every query: a Porter-stemming matcher ("caching" finds "cached", "caches", "cach") and a trigram-substring matcher ("useEff" finds "useEffect"). Their ranked lists are merged via Reciprocal Rank Fusion, so a document that ranks well in both surfaces above one that wins only on a single strategy. Multi-term queries get an additional proximity-rerank pass that boosts passages where the query terms appear close together. Typos are corrected via Levenshtein distance and re-searched. Result snippets are window-extracted around the matched terms, not blindly truncated.
+
+The knowledge base is unified: queries reach indexed content you stored (ctx_index, ctx_fetch_and_index, ctx_batch_execute output) AND auto-captured session memory written by hooks (decisions, errors, blockers, plans, user prompts, rejected approaches, tool failures, compaction guides — 26 event categories). File-backed sources carry a content hash and auto-flag staleness when the source file changes.
+
+WHEN:
+  - You want to recall something that exists in storage (recently indexed content, prior session events, auto-memory) instead of re-reading raw sources
+  - You have multiple related questions about the same body of knowledge — batch every question into one call (the ranking pipeline runs per-query but the round-trip cost is paid once)
+  - You want to scope the query to one labelled source (pass \`source\` — partial match is fine)
+  - You want a chronological view across current session + prior sessions + persistent auto-memory (pass \`sort: "timeline"\` — the default \`relevance\` mode only ranks within the current session)
+  - You want to filter ranked results by content shape (pass \`contentType: "code"\` to surface implementation snippets or \`contentType: "prose"\` to surface explanations)
+
+WHEN NOT:
+  - The data you want to query has never been stored in the knowledge base AND no session memory has accumulated around it — capture first (run a gather-and-index call), then come back here to query
+  - You have one ad-hoc question against data that is not in the knowledge base — answer it inline by running code in the sandbox tool; one round-trip instead of capture-then-query
+
+RETURNS:
+  Per-query ranked sections with window-extracted snippets. Use 2-4 specific technical terms per query. Common session-memory source labels: \`decision\` (user corrections / preferences), \`error\` and \`error-resolution\` (past failures + their fixes), \`blocker\`, \`plan\`, \`user-prompt\`, \`rejected-approach\`, \`compaction\` (post-compact session guide). See ctx_stats for live category counts.
+
+EXAMPLE: ctx_search(queries: ["root cause", "proposed fix", "test coverage"], source: "issue-#683")
+EXAMPLE: ctx_search(queries: ["what did we decide about caching"], source: "decision", sort: "timeline")
+EXAMPLE: ctx_search(queries: ["useEffect cleanup pattern"], source: "react-docs", contentType: "code", limit: 5)
+EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blockers"], sort: "timeline")`,
     inputSchema: z.object({
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
         .optional()
         .describe("Array of search queries. Batch ALL questions in one call.")),
+      // limit: z.coerce.number() (not z.number()) — OpenCode's native
+      // plugin path delivers tool args straight from the LLM provider's
+      // tool-call JSON, where several providers stringify primitives
+      // (limit:"4" instead of limit:4). Since v1.0.139 / #621 we run
+      // inputSchema.parse() on that path, so a plain z.number() rejects
+      // "4" with "Expected number, received string". z.coerce mirrors what
+      // ctx_batch_execute / ctx_fetch_and_index / ctx_execute already do.
+      // Fixes #627.
       limit: z
-        .number()
+        .coerce.number()
         .optional()
         .default(3)
         .describe("Results per query (default: 3)"),
@@ -1854,7 +2344,7 @@ server.registerTool(
         } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
       }
 
-      const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigRoot();
+      const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigDir();
 
       try {
       for (const q of queryList) {
@@ -2235,8 +2725,19 @@ main();
 const FETCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const FETCH_PREVIEW_LIMIT = 3072;
 
+function formatFetchTtl(ttlMs: number): string {
+  if (ttlMs === 0) return "0ms";
+  const day = 24 * 60 * 60 * 1000;
+  const hour = 60 * 60 * 1000;
+  const minute = 60 * 1000;
+  if (ttlMs % day === 0) return `${ttlMs / day}d`;
+  if (ttlMs % hour === 0) return `${ttlMs / hour}h`;
+  if (ttlMs % minute === 0) return `${ttlMs / minute}m`;
+  return `${ttlMs}ms`;
+}
+
 type FetchOneResult =
-  | { kind: "cached"; label: string; chunkCount: number; estimatedBytes: number; ageStr: string }
+  | { kind: "cached"; label: string; chunkCount: number; estimatedBytes: number; ageStr: string; ttlStr: string }
   | { kind: "fetched"; url: string; source?: string; markdown: string; header: string }
   | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" };
 
@@ -2315,10 +2816,23 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
       }
     }
   } catch (err) {
+    // libuv DNS error codes that typically indicate the resolver itself can't
+    // reach a nameserver — common when the MCP host process is running under
+    // a sandbox that blocks outbound network, OR a transient upstream DNS
+    // hiccup. Append an imperative retry hint so the agent does not capitulate
+    // to training data on the FIRST transient failure (PR #654 substitute —
+    // sibling-tool consistency with hooks/core/routing.mjs WebFetch wording).
+    const errCode = (err as NodeJS.ErrnoException | undefined)?.code ?? "";
+    const isTransientDns = errCode === "ETIMEOUT" || errCode === "ETIMEDOUT" ||
+      errCode === "EAI_AGAIN" || errCode === "ENETUNREACH" || errCode === "EPERM";
+    const baseMsg = err instanceof Error ? err.message : String(err);
+    const hint = isTransientDns
+      ? " — transient DNS error; retry once before falling back. If it keeps failing, the MCP host may be running under a network sandbox; restart the host with network access enabled."
+      : "";
     return {
       kind: "fetch_error",
       url: rawUrl,
-      error: `DNS lookup failed for "${parsed.hostname}": ${err instanceof Error ? err.message : String(err)}`,
+      error: `DNS lookup failed for "${parsed.hostname}": ${baseMsg}${hint}`,
       reason: "exit",
     };
   }
@@ -2378,14 +2892,14 @@ export function classifyIp(rawIp: string): "block" | "private" | "public" {
   return "public";
 }
 
-async function fetchOneUrl(url: string, source: string | undefined, force: boolean | undefined): Promise<FetchOneResult> {
+async function fetchOneUrl(url: string, source: string | undefined, force: boolean | undefined, ttl: number | undefined): Promise<FetchOneResult> {
   // SSRF guard — reject file://, javascript:, loopback, RFC1918, IMDS, link-local
   // BEFORE any cache lookup or subprocess spawn. Even cached entries shouldn't
   // serve a previously-poisoned source label.
   const ssrfBlock = await ssrfGuard(url);
   if (ssrfBlock) return ssrfBlock;
 
-  if (!force) {
+  if (!force && ttl !== 0) {
     const store = getStore();
     // Cache key composes (source, url) so two distinct URLs sharing the same
     // `source` label do not collide — they each get their own cache slot
@@ -2395,12 +2909,13 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
     if (meta) {
       const indexedAt = new Date(meta.indexedAt + "Z"); // SQLite datetime is UTC without Z
       const ageMs = Date.now() - indexedAt.getTime();
-      if (ageMs < FETCH_TTL_MS) {
+      const cacheTtlMs = ttl ?? FETCH_TTL_MS;
+      if (ageMs < cacheTtlMs) {
         const ageHours = Math.floor(ageMs / (60 * 60 * 1000));
         const ageMin = Math.floor(ageMs / (60 * 1000));
         const ageStr = ageHours > 0 ? `${ageHours}h ago` : ageMin > 0 ? `${ageMin}m ago` : "just now";
         const estimatedBytes = meta.chunkCount * 1600; // ~1.6KB/chunk avg
-        return { kind: "cached", label: meta.label, chunkCount: meta.chunkCount, estimatedBytes, ageStr };
+        return { kind: "cached", label: meta.label, chunkCount: meta.chunkCount, estimatedBytes, ageStr, ttlStr: formatFetchTtl(cacheTtlMs) };
       }
       // Stale — fall through to re-fetch silently
     }
@@ -2415,7 +2930,18 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
       timeout: 30_000,
     });
     if (result.exitCode !== 0) {
-      return { kind: "fetch_error", url, error: result.stderr || result.stdout || "unknown error", reason: "exit" };
+      // Subprocess fetch failure — undici / fetch can surface EAI_AGAIN /
+      // ETIMEDOUT / ENETUNREACH in stderr when the resolver is overloaded
+      // or the network is briefly unavailable. Append the same retry hint
+      // ssrfGuard's pre-flight DNS path emits so the agent doesn't capitulate
+      // to training data on the first transient failure (PR #654 substitute —
+      // sibling-tool consistency with hooks/core/routing.mjs WebFetch wording).
+      const raw = result.stderr || result.stdout || "unknown error";
+      const isTransientDns = /\b(EAI_AGAIN|ETIMEDOUT|ETIMEOUT|ENETUNREACH|EPERM|getaddrinfo)\b/.test(raw);
+      const hint = isTransientDns
+        ? " — transient DNS error; retry once before falling back. If it keeps failing, the MCP host may be running under a network sandbox; restart the host with network access enabled."
+        : "";
+      return { kind: "fetch_error", url, error: `${raw}${hint}`, reason: "exit" };
     }
     const header = (result.stdout || "").trim();
     let markdown: string;
@@ -2470,7 +2996,7 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
   // Track AFTER the FTS5 write succeeds — failed indexes shouldn't inflate the counter.
   trackIndexed(Buffer.byteLength(f.markdown));
   const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
-    ? f.markdown.slice(0, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
+    ? charSafePrefix(f.markdown, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
     : f.markdown;
   return {
     label: indexed.label,
@@ -2484,16 +3010,27 @@ server.registerTool(
   "ctx_fetch_and_index",
   {
     title: "Fetch & Index URL(s)",
-    description:
-      "Fetches URL content, converts HTML to markdown, indexes into searchable knowledge base, " +
-      "and returns a ~3KB preview. Full content stays in sandbox — use ctx_search() for deeper lookups.\n\n" +
-      "Better than WebFetch: preview is immediate, full content is searchable, raw HTML never enters context.\n\n" +
-      "Content-type aware: HTML is converted to markdown, JSON is chunked by key paths, plain text is indexed directly.\n\n" +
-      "PARALLELIZE I/O: For multi-URL research (library evaluation, migration scans, doc comparisons), pass `requests: [{url, source}, ...]` with `concurrency: 4-8` — speeds up by 3-5x on real workloads.\n" +
-      "  ✅ Use concurrency: 4-8 for: library docs sweep, multi-changelog scan, competitive pricing pages, multi-region docs, GitHub raw file pulls.\n" +
-      "  ❌ Single URL → use the legacy {url, source} shape (concurrency irrelevant).\n" +
-      "  Example: requests: [{url: 'https://react.dev/...', source: 'react'}, {url: 'https://vuejs.org/...', source: 'vue'}], concurrency: 5.\n" +
-      "  Fetches parallelize up to your concurrency setting; FTS5 indexing serializes the writes after (SQLite single-writer rule).",
+    description: `Fetches URL content, converts HTML to markdown (JSON is chunked by key paths, plain text indexed directly), persists it in a searchable knowledge base, and returns a small preview window per source. The raw page bytes never enter your conversation — they live in storage and you retrieve any section on-demand via ctx_search.
+
+Caching: every fetch is cached on disk and reused for repeat calls within the TTL window. The default TTL is 24 hours; override per-call with the \`ttl\` parameter (milliseconds, \`ttl: 0\` bypasses cache like \`force: true\`). Stored content older than 14 days is cleaned up on startup.
+
+WHEN:
+  - You need web content (docs, changelogs, API references, spec pages) and the raw page bytes should NOT enter your conversation
+  - Multi-URL research (library evaluation, migration scans, doc comparisons): pass the \`requests\` array and a \`concurrency\` value 2-8 for parallel I/O
+  - You want repeat lookups against the same URL to be cheap (TTL cache hits return only a hint, no re-fetch)
+  - You want a long-lived cache window (override \`ttl\` upward for stable specs) or a guaranteed-fresh fetch (\`ttl: 0\` or \`force: true\`)
+
+WHEN NOT:
+  - You already have the content locally — store it via the inline index tool
+  - The page is SPA-rendered (JavaScript-required to materialize content) — this is a plain HTTP fetch, no headless browser
+
+RETURNS:
+  Per-source preview windows extracted around indexable headings plus indexing metadata (chunk counts, source labels, cache state). Raw content is NOT echoed back — retrieve any section on-demand via ctx_search(source: "<label>"). Concurrency parallelizes the fetch phase up to your chosen value (capped by the host's logical CPU count); the FTS5 write phase always runs serially because SQLite is a single-writer store. Net latency = max(fetch latency across the pool) + sum(per-source index write time). Cache hits skip both phases and return a small freshness hint instead of re-fetching. Use 4-8 for stable I/O-bound batches; lower the value when the target host enforces a per-IP rate limit you cannot raise.
+
+EXAMPLE: ctx_fetch_and_index(
+  requests: [{url: "https://react.dev/...", source: "react"}, {url: "https://vuejs.org/...", source: "vue"}],
+  concurrency: 5
+)`,
     inputSchema: z.object({
       url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
@@ -2503,13 +3040,15 @@ server.registerTool(
           "Label for the indexed content when using single `url` (e.g., 'React useEffect docs', 'Supabase Auth API'). For batch, put source in each requests entry.",
         ),
       requests: z
-        .array(
-          z.object({
-            url: z.string().describe("URL to fetch"),
-            source: z.string().optional().describe("Label for this URL's indexed content"),
-          }),
+        .preprocess(
+          coerceJsonArray,
+          z.array(
+            z.object({
+              url: z.string().describe("URL to fetch"),
+              source: z.string().optional().describe("Label for this URL's indexed content"),
+            }),
+          ).min(1),
         )
-        .min(1)
         .optional()
         .describe(
           "Batch shape: array of {url, source?} entries. Use with concurrency>1 for parallel fetch. " +
@@ -2529,12 +3068,21 @@ server.registerTool(
           "Indexing is always serial regardless — only fetches race.",
         ),
       force: z
-        .boolean()
+        .preprocess(coerceBoolean, z.boolean())
         .optional()
         .describe("Skip cache and re-fetch even if content was recently indexed"),
+      ttl: z
+        .coerce.number()
+        .int()
+        .min(0)
+        .optional()
+        .describe(
+          "Override the cache freshness window for this call, in milliseconds. " +
+          "`ttl: 0` bypasses the cache like `force: true`; omit to use the default 24h TTL.",
+        ),
     }),
   },
-  async ({ url, source, requests, concurrency, force }) => {
+  async ({ url, source, requests, concurrency, force, ttl }) => {
     // Normalize input: legacy {url} or new {requests: [...]}.
     // requests wins when both are provided (explicit batch intent).
     const batch: { url: string; source?: string }[] = requests
@@ -2559,7 +3107,7 @@ server.registerTool(
     // Parallel fetch via shared runPool primitive. capByCpuCount only for batch
     // — single-URL doesn't need the cap (only one job, executor is one subprocess).
     const jobs: PoolJob<FetchOneResult>[] = batch.map((req) => ({
-      run: () => fetchOneUrl(req.url, req.source, force),
+      run: () => fetchOneUrl(req.url, req.source, force, ttl),
     }));
     const { settled, effectiveConcurrency, capped } = await runPool(jobs, {
       concurrency: requestedConcurrency,
@@ -2568,7 +3116,7 @@ server.registerTool(
 
     // Serial index drain — workers race on fetch, but store.index* runs one at a time.
     type Finalized =
-      | { kind: "cached"; label: string; chunkCount: number; ageStr: string }
+      | { kind: "cached"; label: string; chunkCount: number; ageStr: string; ttlStr: string }
       | { kind: "fetched"; indexed: IndexedFetchResult }
       | { kind: "fetch_error"; url: string; error: string; reason: "exit" | "read" | "empty" | "throw" }
       | { kind: "job_error"; url: string; error: string };
@@ -2597,7 +3145,7 @@ server.registerTool(
             bytesAvoided: cachedBytes,
           })
         );
-        finalized.push({ kind: "cached", label: v.label, chunkCount: v.chunkCount, ageStr: v.ageStr });
+        finalized.push({ kind: "cached", label: v.label, chunkCount: v.chunkCount, ageStr: v.ageStr, ttlStr: v.ttlStr });
       } else if (v.kind === "fetch_error") {
         finalized.push({ kind: "fetch_error", url: v.url, error: v.error, reason: v.reason });
       } else {
@@ -2613,7 +3161,7 @@ server.registerTool(
         return trackResponse("ctx_fetch_and_index", {
           content: [{
             type: "text" as const,
-            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: 24h).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
+            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: ${r.ttlStr}).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
           }],
         });
       }
@@ -2664,7 +3212,7 @@ server.registerTool(
     for (const r of finalized) {
       if (r.kind === "cached") {
         cachedCount++;
-        lines.push(`- [cache] ${r.label} — ${r.chunkCount} sections (${r.ageStr})`);
+        lines.push(`- [cache] ${r.label} — ${r.chunkCount} sections (${r.ageStr}, TTL: ${r.ttlStr})`);
       } else if (r.kind === "fetched") {
         fetchedCount++;
         totalSections += r.indexed.totalChunks;
@@ -2717,18 +3265,32 @@ server.registerTool(
   "ctx_batch_execute",
   {
     title: "Batch Execute & Search",
-    description:
-      "Execute multiple commands in ONE call, auto-index all output, and search with multiple queries. " +
-      "Returns search results directly — no follow-up calls needed.\n\n" +
-      "THIS IS THE PRIMARY TOOL. Use this instead of multiple ctx_execute() calls.\n\n" +
-      "One ctx_batch_execute call replaces 30+ ctx_execute calls + 10+ ctx_search calls.\n" +
-      "Provide all commands to run and all queries to search — everything happens in one round trip.\n\n" +
-      "PARALLELIZE I/O: For I/O-bound batches (network calls, slow API queries, multi-URL fetches), ALWAYS pass concurrency: 4-8 — speeds up by 3-5x on real workloads.\n" +
-      "  ✅ Use concurrency: 4-8 for: gh API calls, curl/web fetches, multi-region cloud queries, multi-repo git reads, dig/DNS, docker inspect.\n" +
-      "  ❌ Keep concurrency: 1 for: npm test, build, lint, image processing (CPU-bound), or commands sharing state (ports, lock files, same-repo writes).\n" +
-      "  Example: [gh issue view 1, gh issue view 2, gh issue view 3] → concurrency: 3.\n" +
-      "  Speedup depends on workload — applies to I/O wait, not CPU work.\n\n" +
-      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.",
+    description: `Run multiple commands in ONE call. Every command's output is auto-indexed into the knowledge base; if you also pass \`queries\`, the matching sections come back in the same round trip so a follow-up search call is not needed.
+
+Concurrency parallelizes the FETCH phase (run-the-commands). The DERIVATION phase — turning raw output into an answer — still belongs in code: add a processing command that consumes the indexed output and prints only the answer, so the raw bytes never enter your conversation (Think-in-Code, same principle as the sandbox tool).
+
+WHEN:
+  - You have 3+ related commands you would otherwise run sequentially (multi-issue lookups, git log + git diff + git blame, multi-file reads, multi-region cloud queries)
+  - You want to gather AND query in one round trip — pass \`queries\` so the matching sections come back inline
+  - You want to parallelize I/O-bound work — pass \`concurrency\` 2-8 (network calls, gh CLI, cloud APIs, multi-repo git reads)
+  - The combined output is large enough that piping it through ctx_search later would itself be expensive — let auto-index + inline queries do both in one shot
+
+WHEN NOT:
+  - Single command with no follow-up query — run it in the sandbox tool directly
+  - CPU-bound or stateful commands — keep concurrency at 1 (npm test, build, lint, port-binding servers, lock-file holders, anything that races on the same resource)
+
+RETURNS:
+  Auto-indexed section list per command label, plus top matches per query (when \`queries\` is passed). Raw output is NOT echoed in full — only the matched windows. Concurrency>1 switches each command to its own per-command timeout (no shared budget); concurrency=1 preserves the legacy shared-budget cascading-skip-on-timeout path. Use 4-8 for I/O-bound batches; keep at 1 for CPU work or shared-state commands; lower the value when target hosts enforce per-IP rate limits.
+
+EXAMPLE: ctx_batch_execute(
+  commands: [
+    {label: "issue 1", command: "gh issue view 1"},
+    {label: "issue 2", command: "gh issue view 2"},
+    {label: "summarize", command: "echo done"}
+  ],
+  queries: ["root cause", "proposed fix"],
+  concurrency: 2
+)`,
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -2973,7 +3535,47 @@ server.registerTool(
               // 49 MB of indexed content sitting in the content DB.
               // Render-time read-only — no DB mutation, no backfill.
               const contentDbPath = getStorePath();
-              const convReal = getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath });
+              // v1.0.148 Bug E+F: a conversation typically spans many
+              // session_ids (resume cycles, /compact rebirths, PID
+              // sub-process sessions launched by ctx_execute). Scoping
+              // per-session loses sandbox-burst bytes_avoided that the
+              // PID-sessions own. Look up THIS session's project_dir
+              // from META and aggregate via META subquery so all
+              // sibling sessions in the same cwd attribute together.
+              // Fallback to sessionId scope if the META lookup fails
+              // (best-effort — the original metric is still defensible).
+              let convReal;
+              try {
+                const Database = loadDatabase();
+                const dbFiles = (await import("node:fs"))
+                  .readdirSync(getSessionDir())
+                  .filter((f) => f.endsWith(".db") && (!dbHash || f.startsWith(dbHash)));
+                let projectDirForSid: string | undefined;
+                for (const file of dbFiles) {
+                  try {
+                    const sdb = new Database(
+                      (await import("node:path")).join(getSessionDir(), file),
+                      { readonly: true },
+                    );
+                    try {
+                      const r = sdb
+                        .prepare("SELECT project_dir FROM session_meta WHERE session_id = ?")
+                        .get(sid) as { project_dir: string } | undefined;
+                      if (r?.project_dir) {
+                        projectDirForSid = r.project_dir;
+                        break;
+                      }
+                    } finally {
+                      sdb.close();
+                    }
+                  } catch { /* skip unreadable DB */ }
+                }
+                convReal = projectDirForSid
+                  ? getRealBytesStats({ projectDir: projectDirForSid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath })
+                  : getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath });
+              } catch {
+                convReal = getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash, contentDbPath });
+              }
               const lifeRealBase = getRealBytesStats({ sessionsDir: getSessionDir() });
               // v1.0.134 SLICE C: lifetime tier sums ALL chunks (no
               // session_id filter). Without this fold, lifetime "kept out"
@@ -3064,6 +3666,13 @@ server.registerTool(
     } else {
       lines.push("[WARN] Performance: NORMAL — install Bun for 3-5x speed boost");
     }
+
+    const sessionStorage = resolveSessionStorageDir(getDefaultSessionDir);
+    const contentStorage = resolveContentStorageDir(getDefaultSessionDir);
+    const statsStorage = resolveStatsStorageDir(getDefaultSessionDir);
+    lines.push(`[OK] Storage sessions: ${sessionStorage.path} (${describeStorageDirectorySource(sessionStorage)})`);
+    lines.push(`[OK] Storage content: ${contentStorage.path} (${describeStorageDirectorySource(contentStorage)})`);
+    lines.push(`[OK] Storage stats: ${statsStorage.path} (${describeStorageDirectorySource(statsStorage)})`);
 
     // Server test — cleanup executor to prevent resource leaks (#247)
     {
@@ -3214,7 +3823,10 @@ server.registerTool(
         `const pkg=JSON.parse(readFileSync(join(T,"package.json"),"utf8"));`,
         `const items=[...(Array.isArray(pkg.files)?pkg.files:[]),"src","package.json"];`,
         `for(const item of items){const from=join(T,item);const to=join(P,item);if(existsSync(from)){rmSync(to,{recursive:true,force:true});cpSync(from,to,{recursive:true,force:true});}}`,
-        `writeFileSync(join(P,".mcp.json"),JSON.stringify({mcpServers:{"context-mode":{command:"node",args:["\${CLAUDE_PLUGIN_ROOT}/start.mjs"]}}},null,2)+"\\n");`,
+        // Issue #609: do NOT write .mcp.json into the cache dir. Claude Code reads
+        // .claude-plugin/plugin.json.mcpServers as the canonical MCP source — the
+        // per-version .mcp.json file is a stale-write vector. Same architectural
+        // fix as the cli.ts upgrade() path; both writers were the only producers.
         `console.log("- [x] Copied package files");`,
         `execFileSync(process.platform==="win32"?"npm.cmd":"npm",["install","--production"],{cwd:P,stdio:"inherit",shell:process.platform==="win32"});`,
         `console.log("- [x] Installed production dependencies");`,
@@ -3283,30 +3895,40 @@ server.registerTool(
   "ctx_purge",
   {
     title: "Purge Knowledge Base",
-    description:
-      "DESTRUCTIVE — permanently delete indexed content. CANNOT be undone.\n\n" +
-      "You MUST specify exactly ONE scope:\n\n" +
-      "  • { confirm: true, sessionId: \"<uuid>\" }\n" +
-      "      Deletes ONLY that session's events + per-session FTS5 chunks.\n" +
-      "      Preserves stats file and ALL other sessions.\n\n" +
-      "  • { confirm: true, scope: \"project\" }\n" +
-      "      Wipes the ENTIRE project: FTS5 knowledge base, every session DB row,\n" +
-      "      events markdown, AND resets the stats file.\n\n" +
-      "REFUSAL RULES (tool returns an error):\n" +
-      "  • confirm: false                              → 'purge cancelled'\n" +
-      "  • Both sessionId AND scope:'project' provided → 'ambiguous — pick one'\n" +
-      "  • scope:'session' without sessionId           → throws (sessionId required)\n" +
-      "  • Neither sessionId NOR scope provided        → DEPRECATED: maps to\n" +
-      "    scope:'project' with a deprecation warning to stderr. Will be a hard\n" +
-      "    error in a future major.\n\n" +
-      "Use sessionId when the user asks to clear a specific conversation's data.\n" +
-      "Use scope:'project' ONLY when the user explicitly asks to reset everything.\n" +
-      "NEVER call with bare {confirm:true} — always specify the scope.",
+    description: `DESTRUCTIVE: permanently delete indexed content. Cannot be undone. Requires confirm:true and exactly one scope.
+
+WHEN:
+  - User explicitly asks to clear a specific session ('purge this session', 'wipe this conversation')
+  - User explicitly asks to reset the whole project ('reset everything', 'wipe the knowledge base')
+
+WHEN NOT:
+  - User says 'reset', 'clear', or 'wipe' without naming a scope -> ask which scope before calling
+  - User wants to free memory or improve performance -> recommend ctx_stats first, do not purge
+
+SCOPES (pass exactly one):
+  - Per-session: ctx_purge(confirm: true, sessionId: "<uuid>") deletes that session's events (auto-captured decisions, errors, plans, user prompts, rejected approaches, etc.) and per-session FTS5 chunks; sibling sessions and stats file are preserved.
+  - Per-project: ctx_purge(confirm: true, scope: "project") wipes FTS5 knowledge base, every session DB row, events markdown, and resets the stats file. Use ctx_stats first to preview category counts before purging.
+
+CONTRACT:
+  - confirm:true is required; confirm:false returns 'purge cancelled'.
+  - sessionId and scope:'project' together return 'ambiguous - pick one'.
+  - scope:'session' without sessionId throws (sessionId required).
+  - Bare {confirm:true} is deprecated: maps to scope:'project' with a stderr warning; will hard-error in a future major.
+
+RETURNS:
+  A summary of removed rows + the resolved scope.
+
+EXAMPLE: ctx_purge(confirm: true, sessionId: "7c8a-1234-5678-9abc-def012345678")
+EXAMPLE: ctx_purge(confirm: true, scope: "project")`,
     // NOTE: schema MUST be a plain z.object — no .refine()/.transform()/
     // .superRefine() wrapper. See block comment above & issue #563. The
     // cross-field ambiguity check lives in the handler body below.
     inputSchema: z.object({
-      confirm: z.boolean().describe(
+      // confirm: wrapped in coerceBoolean preprocessor — OpenCode's native
+      // plugin bridge can deliver `confirm:"true"` / `confirm:"false"` as
+      // string literals. Without this, v1.0.139's inputSchema.parse() path
+      // rejects valid intent as "Expected boolean, received string" (#627).
+      confirm: z.preprocess(coerceBoolean, z.boolean()).describe(
         "MUST be true. Destructive operation; false returns 'purge cancelled'."
       ),
       sessionId: z.string().optional().describe(
@@ -3634,7 +4256,11 @@ server.registerTool(
       "Opens the context-mode Insight dashboard in the browser. " +
       "Shows personal analytics: session activity, tool usage, error rate, " +
       "parallel work patterns, project focus, and actionable insights. " +
-      "First run installs dependencies (~30s). Subsequent runs open instantly.",
+      "First run installs dependencies (~30s). Subsequent runs open instantly. " +
+      "Defaults to port 4747; pass `port` to override. " +
+      "`sessionDir` and `contentDir` override the session/content storage roots " +
+      "(env aliases INSIGHT_SESSION_DIR / INSIGHT_CONTENT_DIR) for diagnosing " +
+      "multi-install setups or pointing at a sibling project's data.",
     inputSchema: z.object({
       port: z.coerce.number().int().min(1).max(65535).optional().describe("Port to serve on (default: 4747)"),
       sessionDir: z.string().optional().describe("Override INSIGHT_SESSION_DIR: directory containing context-mode session .db files"),
@@ -3848,22 +4474,6 @@ server.registerTool(
 // ─────────────────────────────────────────────────────────
 
 async function main() {
-  // Startup sibling sweep (#565). OpenCode/KiloCode spawn one MCP child
-  // per session/subagent and never reap them. When a new MCP child boots
-  // under a host that already has N stale idle siblings (sharing OUR
-  // ppid), reclaim them before opening our own DB / sentinel / stdio.
-  // Best effort — never blocks startup.
-  try {
-    const { startupSiblingSweep } = await import("./util/sibling-mcp.js");
-    const report = await startupSiblingSweep();
-    if (report.totalKilled > 0) {
-      console.error(
-        `Reaped ${report.totalKilled} stale sibling MCP server(s) ` +
-        `(SIGTERM: ${report.terminatedBySigterm}, SIGKILL: ${report.terminatedBySigkill})`,
-      );
-    }
-  } catch { /* best effort */ }
-
   // Clean up stale DB files from previous sessions
   const cleaned = cleanupStaleDBs();
   if (cleaned > 0) {
@@ -3905,36 +4515,7 @@ async function main() {
   process.on("SIGTERM", () => { gracefulShutdown(); });
 
   // Lifecycle guard: detect parent death + stdin close to prevent orphaned processes (#103)
-  // Also: idle self-shutdown (#565) — OpenCode/KiloCode open one MCP child per
-  // session AND per subagent and never tear them down for the host's lifetime,
-  // accumulating one stdio child per session (observed: 26 children / 1.6 GB
-  // RSS under a single `opencode serve` parent). Idle timeout reaps quiescent
-  // servers; live ones bump `recordActivity()` on every JSON-RPC request via
-  // the MCP SDK's `_onrequest` hook wrapped below.
-  const lifecycle = startLifecycleGuard({ onShutdown: () => gracefulShutdown() });
-
-  // Wrap the SDK's internal request entry so every JSON-RPC `tools/call`,
-  // `tools/list`, etc. resets the idle timer. We intercept at this layer
-  // rather than per-tool because (a) it covers ALL requests, including
-  // listTools / listPrompts / listResources / ping, and (b) it survives
-  // future tool additions without each handler needing to remember to opt in.
-  //
-  // The cast is necessary because `_onrequest` is intentionally undocumented
-  // in the SDK's public types. Best effort — if the field shape changes in
-  // a future SDK release the lifecycle still works, idle reset just degrades
-  // to "untriggered" which simply means the server lives until the next
-  // ppid/signal-based exit path fires. We never block the request path.
-  try {
-    type SDKServerInternals = { _onrequest?: (...args: unknown[]) => unknown };
-    const inner = (server.server as unknown as SDKServerInternals);
-    const origOnRequest = inner._onrequest;
-    if (typeof origOnRequest === "function") {
-      inner._onrequest = function (this: unknown, ...args: unknown[]) {
-        try { lifecycle.recordActivity(); } catch { /* never break request path */ }
-        return origOnRequest.apply(this, args);
-      };
-    }
-  } catch { /* best effort — see comment above */ }
+  startLifecycleGuard({ onShutdown: () => gracefulShutdown() });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
@@ -4005,7 +4586,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});
+if (process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS !== "1") {
+  main().catch((err) => {
+    console.error("Fatal:", err);
+    process.exit(1);
+  });
+}

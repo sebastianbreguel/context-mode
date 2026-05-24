@@ -9,11 +9,12 @@
 import { describe, it, test, expect, beforeEach, afterEach } from "vitest";
 import { strict as assert } from "node:assert";
 import { readFileSync, existsSync, accessSync, constants, mkdirSync, writeFileSync, rmSync, readdirSync } from "node:fs";
-import { resolve, join } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { execSync } from "node:child_process";
 import { toUnixPath } from "../../src/cli.js";
+import { findMissingLaunchFiles } from "../../src/util/plugin-cache-integrity.js";
 
 const ROOT = resolve(import.meta.dirname, "../..");
 
@@ -142,41 +143,60 @@ describe("cli.bundle.mjs — marketplace install support", () => {
 // ── .mcp.json — MCP server config ────────────────────────────────────
 
 describe(".mcp.json — MCP server config", () => {
-  it("upgrade writes cached .mcp.json with CLAUDE_PLUGIN_ROOT placeholder (#411)", () => {
+  it("upgrade MUST NOT write `.mcp.json` into the plugin cache dir (Issue #609 architectural lock)", () => {
+    // Bug-class history this lock protects:
+    //   #411 introduced a `.mcp.json` write here with a CLAUDE_PLUGIN_ROOT
+    //   placeholder. That solved an absolute-path-bake symptom but kept the
+    //   write itself in place. Every /ctx-upgrade since then re-baked a
+    //   per-version .mcp.json. When Claude Code's native plugin auto-update
+    //   later copies the previous version's .mcp.json forward into the new
+    //   cache dir, the path goes stale → MODULE_NOT_FOUND on every MCP boot,
+    //   while ctx-doctor stays green (#609).
+    //
+    // Architectural fix: STOP writing `.mcp.json` from cli.ts entirely. The
+    // canonical MCP source is `.claude-plugin/plugin.json.mcpServers`
+    // (Claude Code upstream: mcpPluginIntegration.ts:131-212 reads it first).
+    // The post-bump `sweepStaleMcpJson` call removes any pre-existing files
+    // so the carry-forward vector cannot replay.
+    //
+    // This test enforces the architectural decision. Re-introducing the write
+    // would re-open the bug class regardless of which path shape is used
+    // (placeholder OR absolute) — the write itself is the surface area.
     const src = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
     const upgradeStart = src.indexOf("async function upgrade");
     const upgradeSrc = src.slice(upgradeStart);
-    // items array must NOT include .mcp.json (it's written dynamically)
+    // The items[] copy list must still NOT include .mcp.json (kept from #531).
     const itemsMatch = upgradeSrc.match(/const items\s*=\s*\[([\s\S]*?)\];/);
     expect(itemsMatch).not.toBeNull();
     expect(itemsMatch![1]).not.toContain(".mcp.json");
-    // Must write .mcp.json dynamically with placeholder, not absolute path.
-    // Absolute paths break when sessionstart.mjs (#181) deletes old version dirs.
-    expect(upgradeSrc).toContain('resolve(pluginRoot, ".mcp.json")');
-    expect(upgradeSrc).not.toContain('resolve(pluginRoot, "start.mjs")');
-    expect(upgradeSrc).toContain("${CLAUDE_PLUGIN_ROOT}/start.mjs");
+    // cli.ts upgrade() MUST NOT write `.mcp.json` to pluginRoot. Any
+    // resolve(pluginRoot, ".mcp.json") + writeFileSync chain is forbidden.
+    expect(upgradeSrc).not.toMatch(/writeFileSync\(\s*resolve\(\s*pluginRoot\s*,\s*["']\.mcp\.json["']/);
   });
 
-  it("upgrade .mcp.json placeholder is resilient to version cleanup (#411)", () => {
-    // Simulate two upgrade runs into different pluginRoot dirs and assert both
-    // produce identical placeholder-based args (no absolute paths to old dirs).
+  it("upgrade MUST sweep stale .mcp.json files post-bump (Issue #609)", () => {
+    // Belt-and-braces partner to the no-write lock above: cli.ts MUST call
+    // `sweepStaleMcpJson` after `updatePluginRegistry` so any pre-existing
+    // copies left by prior versions (or carried forward by Claude Code's
+    // auto-update) are removed before the upgrade is declared successful.
     const src = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
+    // Import from the shared heal module — single source of truth.
+    expect(src).toMatch(
+      /sweepStaleMcpJson[^;]*from\s+["']\.\.\/scripts\/heal-installed-plugins\.mjs["']/,
+    );
     const upgradeStart = src.indexOf("async function upgrade");
-    const upgradeSrc = src.slice(upgradeStart);
-    // Extract the literal mcpConfig args entry — must be a string literal
-    // with ${CLAUDE_PLUGIN_ROOT}, not a runtime resolve(pluginRoot, ...) call.
-    const argsMatch = upgradeSrc.match(/args:\s*\[([^\]]+)\]/);
-    expect(argsMatch).not.toBeNull();
-    const argsContent = argsMatch![1];
-    // Must NOT depend on pluginRoot at write-time
-    expect(argsContent).not.toContain("pluginRoot");
-    expect(argsContent).not.toContain("resolve(");
-    // Must contain the literal placeholder
-    expect(argsContent).toContain("${CLAUDE_PLUGIN_ROOT}/start.mjs");
-    // Two simulated runs would produce identical JSON regardless of pluginRoot
-    // because the args value is a static string literal.
-    const literalCount = (upgradeSrc.match(/\$\{CLAUDE_PLUGIN_ROOT\}\/start\.mjs/g) || []).length;
-    expect(literalCount).toBeGreaterThanOrEqual(1);
+    const upgradeSrc = src.slice(upgradeStart, upgradeStart + 16000);
+    // Order constraint: sweep runs AFTER updatePluginRegistry so the
+    // cleanup operates against the final on-disk shape.
+    const updateIdx = upgradeSrc.indexOf("updatePluginRegistry");
+    const sweepIdx = upgradeSrc.indexOf("sweepStaleMcpJson");
+    expect(updateIdx).toBeGreaterThan(-1);
+    expect(sweepIdx).toBeGreaterThan(updateIdx);
+    // Belt-and-braces second-call assertion: if first sweep removed files,
+    // a second pass MUST report removed:[] or upgrade() throws.
+    const block = upgradeSrc.slice(sweepIdx, sweepIdx + 1500);
+    expect(block).toMatch(/sweep drift|sweep check failed/i);
+    expect(block).toMatch(/throw new Error/);
   });
 
   it("plugin manifest keeps ${CLAUDE_PLUGIN_ROOT} for marketplace compatibility", () => {
@@ -204,10 +224,10 @@ describe(".mcp.json — MCP server config", () => {
   it(".mcp.json.example template MUST use ${CLAUDE_PLUGIN_ROOT} placeholder (closes #531)", () => {
     // Architectural lock-in after PR #253 (aea633c) regression:
     // .mcp.json is no longer tracked in source. The canonical template lives
-    // at .mcp.json.example and MUST use the placeholder so that any
-    // contributor or tool that copies it gets the marketplace-correct form.
-    // The placeholder form is what cli.ts upgrade() writes to the plugin
-    // cache (line 843) and what .claude-plugin/plugin.json mcpServers uses.
+    // at .mcp.json.example so contributors who copy it locally still get
+    // the marketplace-correct placeholder form. End-user MCP launch flows
+    // through `.claude-plugin/plugin.json.mcpServers` only — cli.ts no longer
+    // writes `.mcp.json` into the plugin cache (Issue #609 fix).
     const example = JSON.parse(
       readFileSync(resolve(ROOT, ".mcp.json.example"), "utf-8"),
     );
@@ -222,7 +242,7 @@ describe(".mcp.json — MCP server config", () => {
     // the relative form (correct for contributors opening the repo as a
     // regular project). Stop shipping it in the tarball so the two roles
     // never collide again. End users get MCP via .claude-plugin/plugin.json
-    // and cli.ts upgrade()'s plugin-cache write — both placeholder.
+    // — cli.ts no longer writes `.mcp.json` to the plugin cache (#609).
     const pkg = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf-8"));
     expect(pkg.files).toBeDefined();
     expect(pkg.files).not.toContain(".mcp.json");
@@ -999,6 +1019,18 @@ describe("Bin entry uses cli.bundle.mjs", () => {
     expect(loop).toContain(": WARN");
   });
 
+  it("cli doctor treats standalone adapters as not version-comparable", () => {
+    const src = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
+    const versionStart = src.indexOf("Checking versions");
+    const versionBlock = src.slice(versionStart, versionStart + 1800);
+
+    expect(versionBlock).toContain('installedVersion === "standalone"');
+    expect(versionBlock).toContain("standalone MCP mode");
+    expect(versionBlock).toContain("no platform plugin version to compare");
+    expect(versionBlock.indexOf('installedVersion === "standalone"'))
+      .toBeLessThan(versionBlock.indexOf('installedVersion === "not installed"'));
+  });
+
   it("upgrade still reaches hook configuration when already on latest", () => {
     const src = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
     const alreadyLatestIdx = src.indexOf("Already on latest");
@@ -1168,6 +1200,72 @@ describe("start.mjs CLI self-heal", () => {
   test("scripts/plugin-cache-integrity.mjs ships in npm tarball (package.json files[])", () => {
     const pkg = JSON.parse(readFileSync(resolve(ROOT, "package.json"), "utf-8"));
     expect(pkg.files).toContain("scripts/plugin-cache-integrity.mjs");
+  });
+
+  // ── findMissingLaunchFiles — partial-install masking regression (PR #689) ──
+  //
+  // When an interrupted /ctx-upgrade swap leaves the active plugin-cache dir
+  // half-populated, the integrity helper itself
+  // (scripts/plugin-cache-integrity.mjs, shipped in package.json files[]) can
+  // be among the missing files. The doctor then reported only "integrity
+  // helper unavailable", masking the real breakage: the MCP launch entrypoint
+  // (start.mjs / server bundle) was also gone, so
+  // `node ${CLAUDE_PLUGIN_ROOT}/start.mjs` failed and the MCP server never
+  // started.
+  //
+  // findMissingLaunchFiles is a dependency-free (fs-only) check that surfaces
+  // exactly which launch files are absent, so the diagnostic stays useful even
+  // when the integrity helper module cannot load. Folded from the original
+  // tests/util/plugin-cache-launch-files.test.ts in PR #689 per CONTRIBUTING
+  // L282 (no new test files — extend the existing file for the domain).
+  describe("findMissingLaunchFiles (PR #689)", () => {
+    let root: string;
+
+    beforeEach(() => {
+      root = mkdtempSync(join(tmpdir(), "ctx-launch-files-"));
+    });
+    afterEach(() => {
+      rmSync(root, { recursive: true, force: true });
+    });
+
+    const touch = (rel: string): void => {
+      const abs = join(root, rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      writeFileSync(abs, "");
+    };
+
+    it("returns [] when start.mjs and server.bundle.mjs are present", () => {
+      touch("start.mjs");
+      touch("server.bundle.mjs");
+      expect(findMissingLaunchFiles(root)).toEqual([]);
+    });
+
+    it("flags a missing start.mjs (the no-fallback command entrypoint)", () => {
+      touch("server.bundle.mjs");
+      expect(findMissingLaunchFiles(root)).toEqual(["start.mjs"]);
+    });
+
+    it("accepts build/server.js as the server fallback (no false positive)", () => {
+      touch("start.mjs");
+      touch("build/server.js"); // server.bundle.mjs absent, but fallback present
+      expect(findMissingLaunchFiles(root)).toEqual([]);
+    });
+
+    it("flags the server only when BOTH server.bundle.mjs and build/server.js are absent", () => {
+      touch("start.mjs");
+      expect(findMissingLaunchFiles(root)).toEqual([
+        "server.bundle.mjs (or build/server.js)",
+      ]);
+    });
+
+    it("reports every missing launch file for a fully empty (partial) install", () => {
+      // Reproduces the observed broken cache: neither the entrypoint nor the
+      // server bundle was copied by the interrupted swap.
+      expect(findMissingLaunchFiles(root)).toEqual([
+        "start.mjs",
+        "server.bundle.mjs (or build/server.js)",
+      ]);
+    });
   });
 
   // ── Algo-D4 — algorithmic runtime-sibling derivation (#558) ──────────
@@ -1397,6 +1495,27 @@ describe("Cache dir safety (#181)", () => {
     expect(SESSION_SOURCE).toContain("lazy cleanup");
     expect(SESSION_SOURCE).toContain("3600000"); // 1 hour in ms
   });
+
+  // #644: statSync follows symlinks → fresh symlinks pointing at stale targets
+  // were deleted, breaking sessions whose CLAUDE_PLUGIN_ROOT was pinned to one
+  // of those linked versions. lstatSync evaluates the link's own mtime, so a
+  // freshly-created symlink survives the gate even when its target is old.
+  test("sessionstart.mjs cleanup uses lstatSync to age-check entries (#644)", () => {
+    const SESSION_SOURCE = readFileSync(resolve(ROOT, "hooks/sessionstart.mjs"), "utf-8");
+
+    // Isolate the lazy-cleanup block so we don't get false-positives from
+    // unrelated stat calls elsewhere in the file.
+    const blockStart = SESSION_SOURCE.indexOf("Age-gated lazy cleanup");
+    expect(blockStart, "lazy cleanup block must exist").toBeGreaterThan(-1);
+    const block = SESSION_SOURCE.slice(blockStart, blockStart + 1500);
+
+    // The age check MUST use lstatSync (does not follow symlinks).
+    expect(block).toMatch(/lstatSync\(\s*join\(\s*cacheParent\s*,\s*d\s*\)\s*\)/);
+
+    // The age check MUST NOT use statSync (follows symlinks → wrongly evaluates
+    // the link target's mtime, causing fresh symlinks to be deleted).
+    expect(block).not.toMatch(/[^l]statSync\(\s*join\(\s*cacheParent/);
+  });
 });
 
 // ── Issue #185: upgrade must not use execSync (shell) ──
@@ -1580,8 +1699,11 @@ describe("Shell-free upgrade (#185)", () => {
     expect(inlineSection).toContain("pkg.files");
     expect(inlineSection).toContain("Array.isArray(pkg.files)");
     expect(inlineSection).toContain("for(const item of items)");
-    expect(inlineSection).toContain('writeFileSync(join(P,".mcp.json")');
-    expect(inlineSection).toContain("\\${CLAUDE_PLUGIN_ROOT}/start.mjs");
+    // Issue #609: server.ts inline-fallback MUST NOT write `.mcp.json` either.
+    // Same architectural-lock as cli.ts upgrade(). The inline-fallback was the
+    // OTHER producer of per-version `.mcp.json` files — both writers had to go
+    // for the carry-forward bug class to be structurally impossible.
+    expect(inlineSection).not.toContain('writeFileSync(join(P,".mcp.json")');
     expect(inlineSection).not.toContain("copyDirs");
     expect(inlineSection).not.toContain("copyFiles");
   });
@@ -1670,17 +1792,10 @@ describe("Plugin root detection (#PR refactor/opencode-improvements)", () => {
     expect(cacheRootBody).toContain("homedir");
   });
 
-  test("getPluginRoot uses cache path for opencode platform", () => {
+  test("getPluginRoot uses cache path for opencode/kilo platform", () => {
     const getPluginRootStart = CLI_SOURCE.indexOf("function getPluginRoot");
     const getPluginRootBody = CLI_SOURCE.slice(getPluginRootStart, getPluginRootStart + 300);
-    expect(getPluginRootBody).toContain("'opencode'");
-    expect(getPluginRootBody).toContain("cachePluginRoot");
-  });
-
-  test("getPluginRoot uses cache path for kilo platform", () => {
-    const getPluginRootStart = CLI_SOURCE.indexOf("function getPluginRoot");
-    const getPluginRootBody = CLI_SOURCE.slice(getPluginRootStart, getPluginRootStart + 300);
-    expect(getPluginRootBody).toContain("'kilo'");
+    expect(getPluginRootBody).toContain("isInProcessPluginPlatform(platform)");
     expect(getPluginRootBody).toContain("cachePluginRoot");
   });
 });
@@ -2108,5 +2223,123 @@ describe("Upgrade native ABI bootstrap", () => {
     expect(region).toContain("better_sqlite3.abi${process.versions.modules}.node");
     expect(region).toContain("existsSync(bsqAbiCachePath)");
     expect(region).toContain("ABI cache present");
+  });
+});
+
+// ── Issue #613/#609 — doctor() surfaces persistence-tier bug class ─────
+// PR #620 (Family A) shipped the architectural fixes:
+//   - #609: stop writing per-version cache `.mcp.json` + post-bump sweep
+//   - #613: vscode/jetbrains-copilot hook commands ship CLI-dispatcher form
+//           (no absolute `process.execPath` + script path baked into
+//           workspace-committed `.github/hooks/context-mode.json`)
+//
+// These two slices are the *prevention* surface — root-cause fixes that
+// stop the bug from being written. But users on the field can still be
+// holding pre-PR-620 poisoned state:
+//   - already-committed `.github/hooks/context-mode.json` in their repo
+//     with absolute Windows fnm shim paths from v1.0.136 or earlier
+//   - leftover `.mcp.json` in `~/.claude/plugins/cache/.../<version>/`
+//     from /ctx-upgrade flows that ran before PR #620
+//
+// Doctor's job per the verdict family ("silent-green doctor while hooks
+// are dead is itself a P0 trust bug" — ISSUE-604-VERDICT §11) is to
+// SURFACE that pre-PR state BEFORE the user hits a runtime failure.
+//
+// Architect contract for PR #620 + slice 4:
+//   CHECK A: doctor scans workspace Tier C files (`.github/hooks/context-mode.json`,
+//            `.cursor/hooks.json`, `.jetbrains/copilot/hooks.json` under
+//            process.cwd()) — for each that exists, parse JSON, recurse
+//            into all string values, FAIL if any matches absolute path
+//            patterns (unix `/`, Windows `[A-Z]:[/\\]`, `\\`, fnm_multishells).
+//            Remediation: "run `ctx_upgrade` to rewrite to portable form".
+//            Missing config → SKIP (no false fail).
+//
+//   CHECK B: doctor scans `~/.claude/plugins/cache/context-mode/context-mode/*/`
+//            for `.mcp.json` files (post-PR-620 these should not exist).
+//            Found → WARN (not fail) with remediation:
+//            "ctx_upgrade will sweep on next run".
+//
+// Same static-analysis assertion pattern as Issue #564 doctor test (above)
+// and lines 962, 997, 1010 — runtime spawning would need fixture
+// workspaces on three OSes and is not portable; asserting the gate
+// exists in doctor() source catches the regression at PR time.
+describe("PR #620 slice 4 — doctor() surfaces persistence-tier bug class", () => {
+  const CLI_SRC = readFileSync(resolve(ROOT, "src", "cli.ts"), "utf-8");
+
+  function doctorBody(): string {
+    const start = CLI_SRC.indexOf("async function doctor(");
+    expect(start).toBeGreaterThan(-1);
+    const end = CLI_SRC.indexOf("async function insight", start);
+    expect(end).toBeGreaterThan(start);
+    return CLI_SRC.slice(start, end);
+  }
+
+  it("doctor scans workspace Tier C config files for absolute paths (#613 proactive)", () => {
+    const body = doctorBody();
+    // Must reference all three Tier C path shapes that PR #620 covers
+    // (vscode-copilot writes `.github/hooks/context-mode.json`,
+    //  cursor writes `.cursor/hooks.json`,
+    //  jetbrains-copilot writes `.jetbrains/copilot/hooks.json`
+    //  — workspace-committed per ISSUE-613-VERDICT §6.1 Tier C table).
+    expect(body).toContain(".github/hooks/context-mode.json");
+    expect(body).toContain(".cursor/hooks.json");
+    expect(body).toContain(".jetbrains/copilot/hooks.json");
+    // Must detect the fnm-shim pattern (reporter's stderr literally shows
+    // `fnm_multishells/<pid>_<ts>/node.exe` per ISSUE-613-VERDICT §2 H2).
+    expect(body).toMatch(/fnm_multishells/);
+    // Must surface the failure with remediation pointing at ctx_upgrade.
+    // The Tier C section is identifiable by the issue anchor `#613`.
+    const anchorIdx = body.indexOf("#613");
+    expect(anchorIdx).toBeGreaterThan(-1);
+    const window_ = body.slice(
+      Math.max(0, anchorIdx - 500),
+      anchorIdx + 3000,
+    );
+    // The check must use p.log.error or p.log.warn (not info) AND
+    // mention ctx_upgrade so the user knows the remediation.
+    expect(window_).toMatch(/p\.log\.(error|warn)/);
+    expect(window_).toMatch(/ctx[_-]?upgrade/i);
+  });
+
+  it("doctor warns on stale `.mcp.json` files in cache version dirs (#609 proactive)", () => {
+    const body = doctorBody();
+    // Must reference the cache plugin path shape that PR #620 sweeps.
+    // The path nests `context-mode/context-mode` (marketplace/plugin
+    // nesting per ISSUE-609-VERDICT path examples). cli.ts uses
+    // path.join() so the literal appears as adjacent string args:
+    //   join(homedir(), ".claude", "plugins", "cache",
+    //        "context-mode", "context-mode")
+    // We assert on both the cache anchor segments AND the join args
+    // (Mert standing rule — use platform-neutral path joins, not literal
+    // separators that fail on Windows).
+    expect(body).toMatch(/"plugins"\s*,\s*"cache"/);
+    expect(body).toMatch(/"context-mode"\s*,\s*"context-mode"/);
+    // Must check for `.mcp.json` (the file that should not exist after
+    // PR #620's architectural untrack — ISSUE-609-VERDICT §H1 → PR #618 → #620).
+    const anchorIdx = body.indexOf("#609");
+    expect(anchorIdx).toBeGreaterThan(-1);
+    const window_ = body.slice(
+      Math.max(0, anchorIdx - 500),
+      anchorIdx + 2500,
+    );
+    expect(window_).toContain(".mcp.json");
+    // WARN (not FAIL) — the verdict spec is explicit that this is
+    // recoverable: "ctx_upgrade will sweep on next run".
+    expect(window_).toMatch(/p\.log\.warn/);
+    expect(window_).toMatch(/ctx[_-]?upgrade/i);
+  });
+
+  it("doctor uses homedir() (cross-platform) not literal '~' for cache scan", () => {
+    const body = doctorBody();
+    // Mert standing rule: Windows safety. Cache path must resolve via
+    // os.homedir() — not a literal `~/` prefix which fails on Windows.
+    const anchorIdx = body.indexOf("#609");
+    expect(anchorIdx).toBeGreaterThan(-1);
+    const window_ = body.slice(anchorIdx, anchorIdx + 2500);
+    // The scan must use homedir() (already imported at the top of cli.ts).
+    expect(window_).toMatch(/homedir\(\)|process\.env\.HOME/);
+    // And must NOT use a literal `~/` path string (would be treated
+    // literally on Windows).
+    expect(window_).not.toMatch(/["']~\//);
   });
 });

@@ -410,33 +410,18 @@ Full configs: [`configs/cursor/hooks.json`](configs/cursor/hooks.json) | [`confi
 
 **Install:**
 
-1. Install context-mode globally:
-
-   ```bash
-   npm install -g context-mode
-   ```
-
-2. Add to `opencode.json` in your project root (or `~/.config/opencode/opencode.json` for global):
+1. Add to `opencode.json` in your project root (or `~/.config/opencode/opencode.json` for global):
 
    ```json
    {
      "$schema": "https://opencode.ai/config.json",
-     "mcp": {
-       "context-mode": {
-         "type": "local",
-         "command": ["context-mode"],
-         "environment": {
-           "CONTEXT_MODE_IDLE_TIMEOUT_MS": "900000"
-         }
-       }
-     },
      "plugin": ["context-mode"]
    }
    ```
 
-   The `mcp` entry registers all 11 MCP tools. The `plugin` entry enables hooks — OpenCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
+   The `plugin` entry registers all 11 `ctx_*` tools natively and enables hooks — OpenCode calls context-mode's TypeScript plugin in-process, so there is no redundant stdio MCP child per session.
 
-3. *(Optional)* Copy the routing rules file. The model needs an `AGENTS.md` file for routing awareness:
+2. *(Optional)* Copy the routing rules file. The model needs an `AGENTS.md` file for routing awareness:
 
    ```bash
    cp node_modules/context-mode/configs/opencode/AGENTS.md AGENTS.md
@@ -444,9 +429,11 @@ Full configs: [`configs/cursor/hooks.json`](configs/cursor/hooks.json) | [`confi
 
    This tells the model which tools to use and which commands are blocked. Without it, hooks still enforce routing — but the model won't know *why* a command was denied.
 
-4. Restart OpenCode.
+3. Restart OpenCode.
 
 **Verify:** In the OpenCode session, type `ctx stats`. Context-mode tools should appear and respond.
+
+**Upgrade note:** If an existing config has BOTH `plugin: ["context-mode"]` AND `mcp.context-mode`, OpenCode will register zero `ctx_*` tools — the plugin path correctly suppresses MCP duplicates, but the legacy MCP entry confuses the loader. Run `context-mode upgrade` to remove the legacy `mcp.context-mode` entry; your other MCP servers are preserved. v1.0.140+ emits a stderr diagnostic with the same guidance when this happens.
 
 **Routing:** Hooks enforce routing programmatically via `tool.execute.before` and `tool.execute.after`. The optional [`AGENTS.md`](configs/opencode/AGENTS.md) file provides routing instructions for model awareness. The `experimental.session.compacting` hook builds resume snapshots when the conversation compacts. The `experimental.chat.system.transform` hook injects the routing block and prior-session snapshots at session start, enabling session continuity across restarts. The `chat.message` hook captures user prompts and decisions (UserPromptSubmit equivalent).
 
@@ -463,41 +450,28 @@ Full configs: [`configs/opencode/opencode.json`](configs/opencode/opencode.json)
 
 **Install:**
 
-1. Install context-mode globally:
-
-   ```bash
-   npm install -g context-mode
-   ```
-
-2. Add to `kilo.json` in your project root (or `~/.config/kilo/kilo.json` for global):
+1. Add to `kilo.json` in your project root (or `~/.config/kilo/kilo.json` for global):
 
    ```json
    {
      "$schema": "https://app.kilo.ai/config.json",
-     "mcp": {
-       "context-mode": {
-         "type": "local",
-         "command": ["context-mode"],
-         "environment": {
-           "CONTEXT_MODE_IDLE_TIMEOUT_MS": "900000"
-         }
-       }
-     },
      "plugin": ["context-mode"]
    }
    ```
 
-   The `mcp` entry registers all 11 MCP tools. The `plugin` entry enables hooks — KiloCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands and enforcing sandbox routing.
+   The `plugin` entry registers all 11 `ctx_*` tools natively and enables hooks — KiloCode calls context-mode's TypeScript plugin in-process, so there is no redundant stdio MCP child per session.
 
-3. *(Optional)* Copy the routing rules file. KiloCode shares the OpenCode plugin architecture, so the model needs an `AGENTS.md` file for routing awareness:
+2. *(Optional)* Copy the routing rules file. KiloCode shares the OpenCode plugin architecture, so the model needs an `AGENTS.md` file for routing awareness:
 
    ```bash
    cp node_modules/context-mode/configs/opencode/AGENTS.md AGENTS.md
    ```
 
-4. Restart KiloCode.
+3. Restart KiloCode.
 
 **Verify:** In the KiloCode session, type `ctx stats`. Context-mode tools should appear and respond.
+
+**Upgrade note:** If an existing config has BOTH `plugin: ["context-mode"]` AND `mcp.context-mode`, KiloCode will register zero `ctx_*` tools — the plugin path correctly suppresses MCP duplicates, but the legacy MCP entry confuses the loader. Run `context-mode upgrade` to remove the legacy `mcp.context-mode` entry; your other MCP servers are preserved. v1.0.140+ emits a stderr diagnostic with the same guidance when this happens.
 
 **Routing:** Hooks enforce routing programmatically via `tool.execute.before` and `tool.execute.after`. The optional [`AGENTS.md`](configs/opencode/AGENTS.md) file provides routing instructions for model awareness. The `experimental.session.compacting` hook builds resume snapshots when the conversation compacts. The `experimental.chat.system.transform` hook injects the routing block and prior-session snapshots at session start, enabling session continuity across restarts. The `chat.message` hook captures user prompts and decisions (UserPromptSubmit equivalent).
 
@@ -569,6 +543,14 @@ Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
    > (or `codex --enable hooks`). Prefer `[features].hooks`; `[features].codex_hooks`
    > remains accepted as a legacy alias in current Codex builds. Bundled plugin hooks
    > additionally require `plugin_hooks` until Codex enables plugin hooks by default.
+
+   **Custom storage location:** if Codex cannot write the adapter default storage directory, set
+   `CONTEXT_MODE_DIR` to an absolute writable root in the environment that launches Codex. Sessions
+   and stats use `<root>/sessions`; indexed content uses `<root>/content`.
+
+   ```bash
+   CONTEXT_MODE_DIR="$HOME/.codex-context-mode" codex
+   ```
 
 3. Restart Codex CLI and verify MCP with `ctx stats`.
 
@@ -1009,7 +991,7 @@ npm install -g context-mode
 | `ctx_execute_file` | Process files in sandbox. Raw content never leaves. | 45 KB → 155 B |
 | `ctx_index` | Chunk markdown into FTS5 with BM25 ranking. | 60 KB → 40 B |
 | `ctx_search` | Query indexed content with multiple queries in one call. | On-demand retrieval |
-| `ctx_fetch_and_index` | Fetch URL, chunk and index. 24h TTL cache — repeat calls skip network. `force: true` to bypass. Pass `requests: [{url, source}, ...]` + `concurrency: 1-8` for parallel multi-URL. | 60 KB → 40 B |
+| `ctx_fetch_and_index` | Fetch URL, chunk and index. Cache reuses content within TTL (default 24h, override per-call with `ttl: <ms>`). `ttl: 0` or `force: true` to bypass. Pass `requests: [{url, source}, ...]` + `concurrency: 1-8` for parallel multi-URL. | 60 KB → 40 B |
 | `ctx_stats` | Show context savings, call counts, and session statistics. | — |
 | `ctx_doctor` | Diagnose installation: runtimes, hooks, FTS5, versions. | — |
 | `ctx_upgrade` | Upgrade to latest version from GitHub, rebuild, reconfigure hooks. | — |
@@ -1054,11 +1036,12 @@ Search results use intelligent extraction instead of truncation. Instead of retu
 
 ### TTL Cache
 
-Indexed content persists in a per-project SQLite database at `~/.context-mode/content/`. When `ctx_fetch_and_index` is called for a URL that was already indexed within the last 24 hours, the fetch is skipped entirely. The model searches the existing index directly.
+Indexed content persists in a per-project SQLite database at `~/.context-mode/content/`. When `ctx_fetch_and_index` is called for a URL that was already indexed within its TTL window, the fetch is skipped entirely and the model searches the existing index directly.
 
-- **Fresh (<24h):** Returns a cache hint (0.3KB) instead of re-fetching (48KB+). Model proceeds to `ctx_search`.
-- **Stale (>24h):** Re-fetches silently. No user action needed.
-- **`force: true`:** Bypasses cache and re-fetches regardless of TTL.
+- **Default TTL:** 24 hours. Override per-call with `ttl: <milliseconds>` (PR #666). Longer for stable specs, shorter for changelogs you want re-checked often.
+- **Cache hit (within TTL):** Returns a cache hint (~0.3KB) instead of re-fetching (48KB+). Model proceeds to `ctx_search`.
+- **Cache miss (TTL expired):** Re-fetches silently. No user action needed.
+- **`ttl: 0`** or **`force: true`:** Bypasses cache and re-fetches regardless of freshness.
 - **14-day cleanup:** Content databases and sources older than 14 days are removed on startup.
 
 This means `--continue` sessions preserve indexed docs across restarts. No re-fetching, no wasted context tokens.
@@ -1208,7 +1191,7 @@ Tool call output can be collapsed/expanded with the default Pi's default keybind
 
 | Feature | Claude Code | Qwen Code | Gemini CLI | VS Code Copilot | JetBrains Copilot | Cursor | OpenCode | KiloCode | OpenClaw | Codex CLI | Antigravity | Kiro | Zed | Pi | OMP |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| MCP Server | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| MCP Server / Native Tools | Yes | Yes | Yes | Yes | Yes | Yes | Native plugin | Native plugin | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | PreToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
 | PostToolUse Hook | Yes | Yes | Yes | Yes | Yes | Yes | Plugin | Plugin | Plugin | Yes | -- | Yes | -- | Yes (extension) | Plugin |
 | SessionStart Hook | Yes | Yes | Yes | Yes | Yes | -- | ✓ (via experimental.chat.system.transform) | ✓ (via experimental.chat.system.transform) | Plugin | Yes | -- | -- | -- | Yes (extension) | Plugin |
@@ -1401,18 +1384,13 @@ export CTX_FETCH_STRICT=1
 
 That blocks loopback + RFC1918 + ULA in addition to the always-blocked ranges. Useful when context-mode runs as a shared service, not on a developer's own machine.
 
-`tool_input` for any `mcp__*` tool call is also redacted before persistence — keys matching `authorization`, `token`, `secret`, `password`, `api_key`, `cookie`, `signature`, `private_key` get masked to `[REDACTED]` so credentials in MCP arguments don't end up in the session DB.
+`tool_input` for any `mcp__*` tool call is also redacted before persistence — the regex matcher in `hooks/posttooluse.mjs` masks `authorization`, `auth_token`, `access_token`, `refresh_token`, `bearer`, `token`, `secret`, `password`, `passwd`, `pwd`, `api_key` / `apikey` / `x_api_key`, `cookie` / `set-cookie`, `signature`, `private_key`, and `client_secret` (case-insensitive, hyphen/underscore-insensitive) to `[REDACTED]` so credentials in MCP arguments don't end up in the session DB.
 
-### Lifecycle environment variables
-
-Two runtime knobs control how MCP server processes self-manage. Defaults are conservative after [#592](https://github.com/mksglu/context-mode/issues/592): idle self-shutdown is disabled unless a host config explicitly opts in. OpenCode and KiloCode opt in because they open one MCP child per session/subagent; Claude Code/Codex/editor hosts keep registered tool handles after a clean MCP exit and therefore must not idle-exit by default.
+### Storage environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CONTEXT_MODE_IDLE_TIMEOUT_MS` | `0` (disabled) | When set to a positive integer, an MCP child self-exits cleanly after this many milliseconds of stdin/request inactivity. OpenCode and KiloCode configs set `900000` (15 min) because those hosts can accumulate one MCP child per session/subagent. Leave disabled for hosts that do not auto-respawn after MCP EOF (Claude Code, Codex, editor MCP clients) or ctx_* tools may go stale after idle. |
-| `CONTEXT_MODE_STARTUP_SWEEP` | `1` (enabled) | At boot, a newly-spawned MCP child reaps any other context-mode MCP server pids that share its parent process (`sameParentOnly: true` — never touches MCP children of a different host). This reclaims accumulated siblings immediately instead of waiting for each idle timer to fire. Set to `0` or `false` to disable (useful when you intentionally want multiple concurrent MCP children under the same host, e.g. multi-tenant test runners). |
-
-Both vars are read fresh at MCP server start — no restart of the host CLI is required, just spawn a new MCP child (open a new session) for changes to take effect. Invalid/non-numeric `CONTEXT_MODE_IDLE_TIMEOUT_MS` values fall back to `0` (disabled); unrecognized `CONTEXT_MODE_STARTUP_SWEEP` values fall back to enabled.
+| `CONTEXT_MODE_DIR` | Adapter default, for example `~/.codex/context-mode` or `~/.claude/context-mode` | Since v1.0.147. Absolute writable root for context-mode storage. Sessions and stats use `<root>/sessions`; indexed content uses `<root>/content`. Empty or whitespace-only values are treated as unset and shown by `ctx_doctor`; non-empty values must be absolute. `~` is not expanded. |
 
 ### Routing-guidance environment variables
 

@@ -127,7 +127,15 @@ await runHook(async () => {
                   // Extract the script filename (e.g., sessionstart.mjs, pretooluse.mjs)
                   const scriptMatch = h.command.match(/([a-z]+\.mjs)\s*"?\s*$/);
                   if (scriptMatch) {
-                    h.command = "node " + resolve(targetDir, "hooks", scriptMatch[1]);
+                    // Issue #636: quote the script path so spaces in targetDir
+                    // (e.g. Dropbox/iCloud display names like "Lucas Werneck",
+                    // or CLAUDE_CONFIG_DIR pointed at a synced spaced folder)
+                    // don't break /bin/sh's word-splitting at hook-spawn time.
+                    // JSON.stringify is sufficient on Unix and safe on Windows
+                    // (backslashes get escaped — Claude Code's hook layer
+                    //  normalizes to POSIX on Windows anyway via toHookPath).
+                    const scriptPath = resolve(targetDir, "hooks", scriptMatch[1]);
+                    h.command = `node ${JSON.stringify(scriptPath)}`;
                     changed = true;
                   }
                 }

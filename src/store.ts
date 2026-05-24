@@ -15,6 +15,7 @@ import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, 
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -588,7 +589,7 @@ export class ContentStore {
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -633,7 +634,7 @@ export class ContentStore {
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -680,7 +681,7 @@ export class ContentStore {
         highlight(chunks, 1, char(2), char(3)) AS highlighted
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ? AND chunks.content_type = ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -725,7 +726,7 @@ export class ContentStore {
         highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -858,6 +859,70 @@ export class ContentStore {
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
     return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+  }
+
+  // ── Index Directory (#687) ──
+
+  /**
+   * Index every file under a directory by walking it with `walkDirectory` and
+   * delegating each discovered file to `this.index({ path })`. The per-file
+   * `openSync + fstatSync.isFile()` security gate at line ~845 stays active
+   * for every file — directory support never bypasses the TOCTOU defense
+   * from #442 round-3.
+   *
+   * Reported by @matiasduartee in #687.
+   */
+  indexDirectory(opts: {
+    path: string;
+    source?: string;
+    attribution?: { sessionId?: string; eventId?: string };
+    /** Optional per-file deny check — runs INSIDE the walk loop so a denied
+     *  file does not even open a fd. Returns true to deny. */
+    perFileDeny?: (absPath: string) => boolean;
+  } & WalkOptions): {
+    filesIndexed: number;
+    totalChunks: number;
+    capped: boolean;
+    totalSeen: number;
+    denied: number;
+    failed: number;
+    label: string;
+  } {
+    const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
+    const walked = walkDirectoryDetailed(rootPath, walkOpts);
+
+    let filesIndexed = 0;
+    let totalChunks = 0;
+    let denied = 0;
+    let failed = 0;
+
+    for (const file of walked.files) {
+      if (perFileDeny && perFileDeny(file)) {
+        denied++;
+        continue;
+      }
+      try {
+        // Per-file source label so ctx_search(source: "<file>") still works.
+        const fileSource = source ? `${source}:${file}` : file;
+        const r = this.index({ path: file, source: fileSource, attribution });
+        filesIndexed++;
+        totalChunks += r.totalChunks;
+      } catch {
+        // Per-file failure (e.g. fd-bound fstat rejection of a non-regular
+        // file that races between walk and read) — count + continue.
+        failed++;
+      }
+    }
+
+    return {
+      filesIndexed,
+      totalChunks,
+      capped: walked.capped,
+      totalSeen: walked.totalSeen,
+      denied,
+      failed,
+      label: source ?? rootPath,
+    };
   }
 
   // ── Index Plain Text ──
@@ -1007,7 +1072,18 @@ export class ContentStore {
   }
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
-    return sourceMatchMode === "exact" ? source : `%${source}%`;
+    if (sourceMatchMode === "exact") return source;
+    // Escape SQLite LIKE metacharacters so user-supplied source labels
+    // containing `_`, `%`, or `\` are matched literally rather than as
+    // wildcards. Backslash must be replaced first (otherwise subsequent
+    // escapes would themselves be re-escaped). Paired with `ESCAPE '\'`
+    // in the four prepared LIKE statements (#stmtSearchPorter*,
+    // #stmtSearchTrigram*). Regression: #646.
+    const escaped = source
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    return `%${escaped}%`;
   }
 
   search(

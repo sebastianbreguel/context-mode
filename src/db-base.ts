@@ -296,7 +296,18 @@ export function loadDatabase(): typeof DatabaseConstructor {
           const raw = new DatabaseSync(path, {
             readOnly: opts?.readonly ?? false,
           });
-          return new NodeSQLiteAdapter(raw);
+          const adapter = new NodeSQLiteAdapter(raw);
+          // Propagate busy_timeout — node:sqlite's DatabaseSync constructor
+          // silently ignores `{ timeout }` (unlike better-sqlite3's native
+          // C++ constructor), so we set it via PRAGMA, mirroring the Bun
+          // branch above. Without this, the default is 0 and the first
+          // write contention surfaces as immediate `SQLITE_BUSY`/`database
+          // is locked` — defeating the 30s grace `withRetry()` is built
+          // around. See issue #642 and ADR-0001 (multi-writer contract).
+          if (opts?.timeout) {
+            adapter.pragma(`busy_timeout = ${opts.timeout}`);
+          }
+          return adapter;
         } as any;
       } else {
         // node:sqlite missing or built without FTS5 — fall through to
