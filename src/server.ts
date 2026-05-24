@@ -2951,6 +2951,7 @@ server.registerTool(
           // UUID session_id from session_events in this DB.
           let conversation;
           let realBytes;
+          let usageBreakdown;
           try {
             let sid = process.env.CLAUDE_SESSION_ID;
             if (!sid) {
@@ -2961,6 +2962,10 @@ server.registerTool(
             }
             if (sid) {
               conversation = getConversationStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
+              // Per-source attribution for Section 6 ("Where your context went").
+              // Best-effort — failures absorbed so a malformed event row cannot
+              // break ctx_stats.
+              try { usageBreakdown = engine.getUsageBreakdown(sid); } catch { /* never block ctx_stats */ }
               // v1.0.133 Slice 3: pass contentDbPath so getRealBytesStats can
               // join chunks WHERE session_id = sid and fold the indexed
               // content bytes into the per-conversation bar. Without this,
@@ -2994,7 +2999,7 @@ server.registerTool(
           // the MCP server's chdir'd plugin install dir. getProjectDir()
           // includes v1.0.115's transcript heuristic which reads the literal
           // cwd from Claude Code's session jsonl.
-          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, cwd: projectDir });
+          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, usageBreakdown, cwd: projectDir });
         } finally {
           sdb.close();
         }

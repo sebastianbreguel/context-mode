@@ -78,6 +78,25 @@ export interface McpToolUsageRow {
 }
 
 /**
+ * Usage breakdown row — per-source bytes attribution for the "where your
+ * context went" section. Mirrors Claude Code's native /usage feature
+ * (skills / subagents / MCP servers) plus an honest "we held back" column
+ * that /usage cannot produce. Direct event bytes only — transitive bytes
+ * from downstream tool calls launched by a skill are not yet attributed.
+ *
+ * `pctOfReturned` is share of bytes that DID enter context. Sources whose
+ * output was fully sandboxed (avoided > 0, returned == 0) appear with
+ * pct = 0 and a non-zero `bytesAvoided`.
+ */
+export interface UsageBreakdownRow {
+  kind: "skill" | "subagent" | "mcp";
+  source: string;
+  bytesReturned: number;
+  bytesAvoided: number;
+  pctOfReturned: number;
+}
+
+/**
  * Conversation-scoped stats — aggregated from `session_events` for a single
  * `session_id` across every worktree DB plus the compact-rescue snapshot from
  * `session_resume`. Replaces the broken in-memory `tool_call_counter` that
@@ -397,6 +416,130 @@ export class AnalyticsEngine {
 
     // Stable sort: most-called first, then alphabetical
     out.sort((a, c) => c.calls - a.calls || a.tool_name.localeCompare(c.tool_name));
+    return out;
+  }
+
+  /**
+   * Usage breakdown — per-source bytes attribution for the current session.
+   *
+   * Mirrors the shape of Claude Code's native /usage feature (skills /
+   * subagents / MCP servers) but adds a `bytesAvoided` column so the
+   * renderer can show "we held back N KB of raw output you'd otherwise
+   * see in context" alongside the % share. That savings column is the
+   * differentiator — /usage shows raw consumption only.
+   *
+   * Direct event bytes only. Bytes from tool calls *launched by* a skill
+   * are attributed to those tools, not the skill — transitive attribution
+   * requires session-window tracking (skill_enter/skill_exit), which is a
+   * follow-up. Document the limitation in the rendered output.
+   *
+   * Subagent attribution: at the time the Agent hook fires, the
+   * subagent_type is in `tool_input.subagent_type` but `extractSubagent`
+   * stores only the prompt in `data`. Until that hook is extended, all
+   * subagent bytes are bucketed under a single "all" row so the user
+   * still sees their total subagent footprint.
+   *
+   * MCP server name is parsed from `mcp__<server>__<tool>` payloads
+   * stored under category="mcp_tool_call" (extract.ts:672). The bytes
+   * for those rows are the truncated params blob (max 2KB), so MCP
+   * accounting tracks bytes_returned/bytes_avoided from the SAME row,
+   * not the response-carrying category="mcp" rows. Honest tradeoff:
+   * MCP server % reflects call-shape bytes plus whatever the hook
+   * recorded as bytes_returned for that event — typically the full
+   * response when the host populated it.
+   */
+  getUsageBreakdown(sessionId: string): UsageBreakdownRow[] {
+    type Row = { category: string; data: string; bytes_returned: number; bytes_avoided: number };
+    let rows: Row[];
+    try {
+      // SIZE SOURCE: we use length(data) — the captured serialized form —
+      // rather than session_events.bytes_returned. The hook does not yet
+      // populate bytes_returned for skill/subagent/mcp_tool_call events
+      // (verified against every session DB on disk as of v1.0.151), so
+      // bytes_returned is uniformly 0 for these categories in production.
+      // length(data) is a faithful proxy because `data` is the redacted
+      // serialized payload the hook captured — same bytes that flow into
+      // any future re-served context window. Older DBs without
+      // bytes_avoided are tolerated by the COALESCE: missing column is
+      // caught by the outer try/catch.
+      rows = this.db.prepare(
+        `SELECT category, data, length(data) AS bytes_returned, COALESCE(bytes_avoided, 0) AS bytes_avoided
+           FROM session_events
+          WHERE session_id = ?
+            AND category IN ('skill', 'subagent', 'mcp_tool_call')`,
+      ).all(sessionId) as Row[];
+    } catch {
+      return [];
+    }
+
+    // key = `${kind}\x1f${source}` so distinct kinds with the same name
+    // don't collide (unlikely but cheap to enforce).
+    const agg = new Map<string, { kind: "skill" | "subagent" | "mcp"; source: string; bR: number; bA: number }>();
+    const bump = (kind: "skill" | "subagent" | "mcp", source: string, bR: number, bA: number) => {
+      const key = `${kind}\x1f${source}`;
+      const cur = agg.get(key) ?? { kind, source, bR: 0, bA: 0 };
+      cur.bR += bR;
+      cur.bA += bA;
+      agg.set(key, cur);
+    };
+
+    for (const r of rows) {
+      const bR = Number(r.bytes_returned ?? 0);
+      const bA = Number(r.bytes_avoided ?? 0);
+      if (r.category === "skill") {
+        // `data` is the bare skill name (extract.ts:503). Empty → "(unknown)".
+        const name = (r.data ?? "").trim() || "(unknown)";
+        bump("skill", name, bR, bA);
+      } else if (r.category === "subagent") {
+        // Per-type attribution requires extractSubagent to store
+        // subagent_type — until then, bucket all under "all".
+        bump("subagent", "all", bR, bA);
+      } else if (r.category === "mcp_tool_call") {
+        // `data` is JSON: {"tool_name":"mcp__<server>__<tool>","params":...}
+        // Parse server segment; on any failure, bucket as "(unknown)".
+        let server = "(unknown)";
+        try {
+          const parsed = JSON.parse(r.data ?? "{}") as { tool_name?: unknown };
+          const tn = typeof parsed.tool_name === "string" ? parsed.tool_name : "";
+          if (tn.startsWith("mcp__")) {
+            const parts = tn.split("__");
+            // ["mcp", "<server>", "<tool>", ...] — server is index 1.
+            // For pathological names with extra "__" in the server segment,
+            // everything between the leading "mcp" and the final "__<tool>"
+            // is the server.
+            if (parts.length >= 3) {
+              server = parts.slice(1, -1).join("__") || "(unknown)";
+            }
+          }
+        } catch {
+          // leave server as "(unknown)"
+        }
+        bump("mcp", server, bR, bA);
+      }
+    }
+
+    // Total returned across ALL kinds (the denominator of pctOfReturned).
+    // We share the same denominator across kinds so per-section %s are
+    // directly comparable, matching Claude Code's /usage framing where
+    // all categories share one "% of usage" total.
+    let totalReturned = 0;
+    for (const v of agg.values()) totalReturned += v.bR;
+
+    const out: UsageBreakdownRow[] = [];
+    for (const v of agg.values()) {
+      out.push({
+        kind: v.kind,
+        source: v.source,
+        bytesReturned: v.bR,
+        bytesAvoided: v.bA,
+        pctOfReturned: totalReturned > 0
+          ? Math.round((v.bR / totalReturned) * 1000) / 10
+          : 0,
+      });
+    }
+
+    // Sort: bytesReturned DESC, then source ASC. Stable across runs.
+    out.sort((a, b) => b.bytesReturned - a.bytesReturned || a.source.localeCompare(b.source));
     return out;
   }
 
@@ -1858,6 +2001,7 @@ function renderNarrative5Section(args: {
   lifetime?: LifetimeStats;
   multiAdapter?: MultiAdapterLifetimeStats;
   realBytes?: { lifetime?: RealBytesStats; conversation?: RealBytesStats };
+  usageBreakdown?: UsageBreakdownRow[];
   cwd: string;
   locale: string;
   tz: string;
@@ -1865,7 +2009,7 @@ function renderNarrative5Section(args: {
   version?: string;
   latestVersion?: string | null;
 }): string[] {
-  const { conversation, lifetime, multiAdapter, realBytes, cwd, locale, tz, now, version, latestVersion } = args;
+  const { conversation, lifetime, multiAdapter, realBytes, usageBreakdown, cwd, locale, tz, now, version, latestVersion } = args;
   const out: string[] = [];
 
   // ── Token math (same monotonic-growth invariant as the legacy branch).
@@ -2081,6 +2225,38 @@ function renderNarrative5Section(args: {
   }
   out.push("");
   out.push("");
+
+  // ── Section 6 — Where your context went (per-source attribution).
+  // Mirrors Claude Code's /usage breakdown (skills / subagents / MCP
+  // servers) with an honest "we held back" column showing bytes_avoided —
+  // the differentiator /usage cannot produce. Skipped when the caller
+  // doesn't supply usageBreakdown so legacy renders stay byte-identical.
+  if (usageBreakdown && usageBreakdown.length > 0) {
+    out.push("  ─── 6. Where your context went ───");
+    out.push("");
+    // Integer percentages match Claude Code's /usage screenshot exactly
+    // (8%, 11%, 13% — never 8.0%). Sub-1% rows would render as "0%" which
+    // is honest: anything under half a percent contributes negligibly.
+    const fmtPct = (p: number) => `${Math.round(p)}%`;
+    const renderGroup = (label: string, kind: "skill" | "subagent" | "mcp") => {
+      const rows = usageBreakdown.filter((r) => r.kind === kind);
+      if (rows.length === 0) return;
+      out.push(`  ${label.padEnd(26)} % of usage   we held back`);
+      for (const r of rows) {
+        const name = r.source.length > 26 ? r.source.slice(0, 23) + "..." : r.source;
+        const pct  = fmtPct(r.pctOfReturned).padStart(6);
+        const held = r.bytesAvoided > 0 ? kb(r.bytesAvoided).padStart(8) : "      —";
+        out.push(`    ${name.padEnd(24)} ${pct}     ${held}`);
+      }
+      out.push("");
+    };
+    renderGroup("Skills",      "skill");
+    renderGroup("Subagents",   "subagent");
+    renderGroup("MCP servers", "mcp");
+    out.push("  (direct event bytes; tools a skill launches are attributed to those tools, not the skill.)");
+    out.push("");
+    out.push("");
+  }
 
   // ── Footer.
   out.push("  Your AI talks less, remembers more, costs less.");
@@ -2607,6 +2783,13 @@ export function formatReport(
      */
     multiAdapter?: MultiAdapterLifetimeStats;
     /**
+     * Per-source usage breakdown (skills / subagents / MCP servers).
+     * When supplied alongside `conversation`, the narrative renderer
+     * emits a Section 6 "Where your context went" block mirroring
+     * Claude Code's native /usage feature plus an honest savings column.
+     */
+    usageBreakdown?: UsageBreakdownRow[];
+    /**
      * 5-section narrative renderer overrides. Defaults to ambient
      * `process.cwd()` + `Date.now()` + `detectLocaleAndTz()` for production
      * use; tests inject deterministic values so output is byte-stable.
@@ -2624,6 +2807,7 @@ export function formatReport(
   const conversation = opts?.conversation;
   const realBytes = opts?.realBytes;
   const multiAdapter = opts?.multiAdapter;
+  const usageBreakdown = opts?.usageBreakdown;
   // Real-adapter count drives the "across N AI tools" headline copy
   // (Slice 3.4) — we only call something a "tool you used" once it
   // passes the isReal filter inside getMultiAdapterLifetimeStats.
@@ -2680,7 +2864,7 @@ export function formatReport(
     const locale = opts?.locale ?? detected.locale;
     const tz     = opts?.tz     ?? detected.tz;
     lines.push(...renderNarrative5Section({
-      conversation, lifetime, multiAdapter, realBytes,
+      conversation, lifetime, multiAdapter, realBytes, usageBreakdown,
       cwd, locale, tz, now, version, latestVersion,
     }));
     return lines.join("\n");

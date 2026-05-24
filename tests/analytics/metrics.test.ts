@@ -26,6 +26,8 @@ function createSchema(db: Database.Database): void {
       priority INTEGER NOT NULL DEFAULT 2,
       data TEXT NOT NULL,
       source_hook TEXT NOT NULL,
+      bytes_avoided INTEGER NOT NULL DEFAULT 0,
+      bytes_returned INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       data_hash TEXT NOT NULL DEFAULT ''
     );
@@ -62,12 +64,14 @@ interface InsertEventParams {
   source_hook?: string;
   created_at?: string;
   data_hash?: string;
+  bytes_avoided?: number;
+  bytes_returned?: number;
 }
 
 function insertEvent(db: Database.Database, params: InsertEventParams): void {
   db.prepare(`
-    INSERT INTO session_events (session_id, type, category, priority, data, source_hook, created_at, data_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO session_events (session_id, type, category, priority, data, source_hook, bytes_avoided, bytes_returned, created_at, data_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     params.session_id,
     params.type,
@@ -75,6 +79,8 @@ function insertEvent(db: Database.Database, params: InsertEventParams): void {
     params.priority ?? 2,
     params.data,
     params.source_hook ?? "PostToolUse",
+    params.bytes_avoided ?? 0,
+    params.bytes_returned ?? 0,
     params.created_at ?? new Date().toISOString().replace("T", " ").slice(0, 19),
     params.data_hash ?? "",
   );
@@ -315,6 +321,98 @@ describe("Analytics Metrics", () => {
 
     it("returns empty array when no mcp_tool_call events exist", () => {
       expect(engine.getMcpToolUsage()).toEqual([]);
+    });
+  });
+
+  describe("getUsageBreakdown", () => {
+    it("attributes bytes per skill, subagent, and MCP server", () => {
+      // Size is taken from length(data) — the serialized form the hook
+      // captured. We use payload strings sized to test percentage math.
+
+      // Skills — `data` is the bare skill name (extract.ts:503).
+      // "write" → 5 bytes, "panel" → 5 bytes. bytes_avoided is honored.
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "skill", category: "skill",
+        data: "write", bytes_avoided: 0,
+      });
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "skill", category: "skill",
+        data: "panel", bytes_avoided: 200,
+      });
+
+      // Subagents — all bucket as "all" until extractSubagent stores type.
+      // Padded to ~2000 bytes so it dominates the breakdown like in real life.
+      const subagentBody = "[completed] " + "x".repeat(1988); // length = 2000
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "subagent_completed", category: "subagent",
+        data: subagentBody, bytes_avoided: 0,
+      });
+
+      // MCP — `data` is JSON with full tool_name. Server = middle segment.
+      const ctxData = JSON.stringify({
+        tool_name: "mcp__context-mode__ctx_search",
+        params: { queries: ["x".repeat(1400)] }, // pad so length ~1500
+      });
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "mcp_tool_call", category: "mcp_tool_call", priority: 4,
+        data: ctxData, bytes_avoided: 8000,
+      });
+      const phData = JSON.stringify({
+        tool_name: "mcp__posthog__exec",
+        params: { sql: "x".repeat(4900) }, // pad so length ~5000
+      });
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "mcp_tool_call", category: "mcp_tool_call", priority: 4,
+        data: phData, bytes_avoided: 0,
+      });
+
+      const breakdown = engine.getUsageBreakdown(SESSION_ID);
+
+      const skills = breakdown.filter((r) => r.kind === "skill");
+      expect(skills.map((r) => r.source).sort()).toEqual(["panel", "write"]);
+      // length("write") = 5 bytes.
+      expect(skills.find((r) => r.source === "write")!.bytesReturned).toBe(5);
+      expect(skills.find((r) => r.source === "panel")!.bytesAvoided).toBe(200);
+
+      const subagents = breakdown.filter((r) => r.kind === "subagent");
+      expect(subagents).toHaveLength(1);
+      expect(subagents[0].source).toBe("all");
+      expect(subagents[0].bytesReturned).toBe(2000);
+
+      const mcps = breakdown.filter((r) => r.kind === "mcp");
+      expect(mcps.map((r) => r.source).sort()).toEqual(["context-mode", "posthog"]);
+      expect(mcps.find((r) => r.source === "context-mode")!.bytesAvoided).toBe(8000);
+      expect(mcps.find((r) => r.source === "context-mode")!.bytesReturned).toBe(ctxData.length);
+      expect(mcps.find((r) => r.source === "posthog")!.bytesReturned).toBe(phData.length);
+
+      // Subagent dominates by far (~2000 of ~8500 total).
+      expect(subagents[0].pctOfReturned).toBeGreaterThan(20);
+      // Skills are tiny (just names).
+      expect(skills[0].pctOfReturned).toBeLessThan(1);
+    });
+
+    it("ignores other sessions and unrelated categories", () => {
+      insertEvent(db, {
+        session_id: "other-session", type: "skill", category: "skill",
+        data: "leak",
+      });
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "file", category: "file",
+        data: "/path/to/file",
+      });
+      expect(engine.getUsageBreakdown(SESSION_ID)).toEqual([]);
+    });
+
+    it("returns empty array on malformed mcp_tool_call data", () => {
+      insertEvent(db, {
+        session_id: SESSION_ID, type: "mcp_tool_call", category: "mcp_tool_call",
+        data: "not json {{{",
+      });
+      const out = engine.getUsageBreakdown(SESSION_ID);
+      // The row still counts under kind="mcp" with source="(unknown)".
+      expect(out).toHaveLength(1);
+      expect(out[0].kind).toBe("mcp");
+      expect(out[0].source).toBe("(unknown)");
     });
   });
 });

@@ -15,6 +15,7 @@ import type {
   FullReport,
   LifetimeStats,
   MultiAdapterLifetimeStats,
+  UsageBreakdownRow,
 } from "../../src/session/analytics.js";
 
 function baseReport(): FullReport {
@@ -367,5 +368,90 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(text).toMatch(/Working directory/);
     // Must contain bar characters under the persistent memory header.
     expect(text).toMatch(/Persistent memory[\s\S]*?Files tracked[\s\S]*?█/);
+  });
+
+  // ── Section 6 — Where your context went (per-source attribution).
+  // Mirrors Claude Code's native /usage feature plus a savings column.
+  // Skipped when usageBreakdown is absent so legacy renders stay
+  // byte-identical with prior versions.
+  test("Section 6 renders skills/subagents/MCP rows when usageBreakdown is provided", () => {
+    const conv: ConversationStats = {
+      sessionId: "section-6-fixture",
+      events: 50,
+      dbCount: 1,
+      daysAlive: 1,
+      snapshotBytes: 0,
+      snapshotsConsumed: 0,
+      byCategory: [{ category: "file", count: 10, label: "Files tracked" }],
+      firstEventMs: Date.UTC(2026, 4, 24, 9, 0, 0),
+      lastEventMs:  Date.UTC(2026, 4, 24, 11, 0, 0),
+    };
+    const usageBreakdown: UsageBreakdownRow[] = [
+      { kind: "skill",    source: "panel",        bytesReturned: 8000, bytesAvoided:    0, pctOfReturned: 8 },
+      { kind: "skill",    source: "write",        bytesReturned: 6000, bytesAvoided: 2048, pctOfReturned: 6 },
+      { kind: "subagent", source: "all",          bytesReturned: 9000, bytesAvoided:    0, pctOfReturned: 9 },
+      { kind: "mcp",      source: "context-mode", bytesReturned: 4000, bytesAvoided: 72000, pctOfReturned: 4 },
+      { kind: "mcp",      source: "posthog",      bytesReturned: 11000, bytesAvoided:    0, pctOfReturned: 11 },
+    ];
+
+    const text = formatReport(baseReport(), "1.0.151", null, {
+      conversation: conv,
+      usageBreakdown,
+      cwd: "/p/section-6",
+      now: Date.UTC(2026, 4, 24, 12, 0, 0),
+      locale: "en-US",
+      tz: "UTC",
+    });
+
+    // Section header present and in the right order (after Section 5).
+    const idx5 = text.indexOf("─── 5. What context-mode learned about how you work ───");
+    const idx6 = text.indexOf("─── 6. Where your context went ───");
+    expect(idx5).toBeGreaterThan(-1);
+    expect(idx6).toBeGreaterThan(idx5);
+
+    // All three kind labels rendered.
+    expect(text).toContain("Skills");
+    expect(text).toContain("Subagents");
+    expect(text).toContain("MCP servers");
+
+    // Sources appear under their group, with their pct.
+    expect(text).toMatch(/panel\s+8%/);
+    expect(text).toMatch(/write\s+6%/);
+    expect(text).toMatch(/context-mode\s+4%/);
+    expect(text).toMatch(/posthog\s+11%/);
+
+    // Savings column: rows with bytesAvoided > 0 show a KB number; others show em-dash.
+    // context-mode held back 72000 bytes → ~70.3 KB after kb() formatter.
+    expect(text).toMatch(/context-mode[^\n]*\d+(\.\d+)? KB/);
+    // posthog line should contain "—" (no held-back bytes).
+    expect(text).toMatch(/posthog[^\n]*—/);
+  });
+
+  test("Section 6 is omitted when usageBreakdown is empty or absent", () => {
+    const conv: ConversationStats = {
+      sessionId: "section-6-empty",
+      events: 50,
+      dbCount: 1,
+      daysAlive: 1,
+      snapshotBytes: 0,
+      snapshotsConsumed: 0,
+      byCategory: [{ category: "file", count: 10, label: "Files tracked" }],
+      firstEventMs: Date.UTC(2026, 4, 24, 9, 0, 0),
+      lastEventMs:  Date.UTC(2026, 4, 24, 11, 0, 0),
+    };
+
+    // Absent → no Section 6.
+    const noOpt = formatReport(baseReport(), "1.0.151", null, {
+      conversation: conv,
+      cwd: "/p/section-6", now: Date.UTC(2026, 4, 24, 12), locale: "en-US", tz: "UTC",
+    });
+    expect(noOpt).not.toContain("─── 6. Where your context went ───");
+
+    // Empty array → no Section 6.
+    const emptyOpt = formatReport(baseReport(), "1.0.151", null, {
+      conversation: conv, usageBreakdown: [],
+      cwd: "/p/section-6", now: Date.UTC(2026, 4, 24, 12), locale: "en-US", tz: "UTC",
+    });
+    expect(emptyOpt).not.toContain("─── 6. Where your context went ───");
   });
 });
