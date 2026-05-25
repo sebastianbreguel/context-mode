@@ -1228,23 +1228,13 @@ async function upgrade(opts?: { platform?: string }) {
       // The post-bump cache-sweep below removes any pre-existing copies so
       // the previous-version-carry vector cannot replay.
 
-      // Normalize hooks.json + plugin.json against the REAL pluginRoot now that
-      // files have been copied. Two reasons:
-      //   1. If a prior buggy postinstall (or any future regression) baked the
-      //      tmpdir path into hooks.json, this rewrites it to pluginRoot before
-      //      the next hook fires.
-      //   2. Closes the same gap #414 closed for fresh installs — the first
-      //      hook fire after upgrade now works without waiting for MCP boot.
-      try {
-        const mod: { normalizeHooksOnStartup: (opts: { pluginRoot: string; nodePath: string; platform: string }) => void } =
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (await import("../hooks/normalize-hooks.mjs" as any)) as any;
-        mod.normalizeHooksOnStartup({
-          pluginRoot,
-          nodePath: process.execPath,
-          platform: process.platform,
-        });
-      } catch { /* best effort — never block upgrade */ }
+      // Issue #711: do NOT call normalizeHooksOnStartup during upgrade.
+      // The fresh clone files ship with ${CLAUDE_PLUGIN_ROOT} placeholders —
+      // the portable form that survives across versioned cache directories.
+      // normalizeHooksOnStartup bakes in absolute paths using the CURRENT
+      // pluginRoot (e.g. .../1.0.103/), but Claude Code may copy files to a
+      // NEW versioned dir (.../1.0.151/) making the baked-in paths stale.
+      // start.mjs normalizes on next MCP boot with the correct __dirname.
 
       s.stop(color.green(`Updated in-place to v${newVersion}`));
 

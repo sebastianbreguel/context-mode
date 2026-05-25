@@ -615,6 +615,68 @@ describe("healPluginJsonMcpServers (Issue #523)", () => {
       "${CLAUDE_PLUGIN_ROOT}/start.mjs",
     );
   });
+
+  // Issue #711 — stale versioned cache-dir path (NOT tmpdir).
+  // normalizeHooksOnStartup bakes in .../1.0.103/start.mjs during upgrade,
+  // then Claude Code copies files to .../1.0.151/ — carrying the stale path.
+  it("rewrites stale versioned cache-dir path to placeholder (Issue #711)", () => {
+    const cacheRoot = makeTmp("ctx-issue711-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.151",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const stalePath =
+      resolve(cacheRoot, "context-mode", "context-mode", "1.0.103", "start.mjs");
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: stalePath,
+    });
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("plugin-json-args");
+    const after = JSON.parse(readFileSync(pluginJsonPath, "utf-8"));
+    expect(after.mcpServers["context-mode"].args[0]).toBe(
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    );
+  });
+
+  // Issue #711 — Windows backslash variant of stale cache-dir path.
+  it("rewrites Windows stale cache-dir path to placeholder (Issue #711)", () => {
+    const cacheRoot = makeTmp("ctx-issue711-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.151",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const winStalePath =
+      "C:\\Users\\Mert\\.claude\\plugins\\cache\\context-mode\\context-mode\\1.0.103\\start.mjs";
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: winStalePath,
+    });
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("plugin-json-args");
+    const after = JSON.parse(readFileSync(pluginJsonPath, "utf-8"));
+    expect(after.mcpServers["context-mode"].args[0]).toBe(
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    );
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -850,6 +912,36 @@ describe("healMcpJsonArgs (Issue #531)", () => {
 
     expect(result.healed).toEqual([]);
     expect(result.skipped).toBe("no-mcp-json");
+  });
+
+  // Issue #711 — stale versioned cache-dir path in .mcp.json
+  it("rewrites stale versioned cache-dir path to placeholder (Issue #711)", () => {
+    const cacheRoot = makeTmp("ctx-issue711-mcp-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.151",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const stalePath =
+      resolve(cacheRoot, "context-mode", "context-mode", "1.0.103", "start.mjs");
+    const mcpJsonPath = buildPoisonedMcpJson({
+      pluginRoot,
+      args0: stalePath,
+    });
+
+    const result = healMcpJsonArgs({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("mcp-json-args");
+    const after = JSON.parse(readFileSync(mcpJsonPath, "utf-8"));
+    expect(after.mcpServers["context-mode"].args[0]).toBe(
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    );
   });
 });
 
