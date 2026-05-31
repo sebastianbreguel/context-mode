@@ -53,6 +53,11 @@ import {
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { searchAllSources } from "./search/unified.js";
+import {
+  buildCtxSearchInputSchema,
+  CTX_SEARCH_SHARED_MODE,
+  resolveProjectScope,
+} from "./search/ctx-search-schema.js";
 import { buildNodeCommand, type HookAdapter, type PlatformId, isInProcessPluginPlatform } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
@@ -2361,41 +2366,11 @@ EXAMPLE: ctx_search(queries: ["root cause", "proposed fix", "test coverage"], so
 EXAMPLE: ctx_search(queries: ["what did we decide about caching"], source: "decision", sort: "timeline")
 EXAMPLE: ctx_search(queries: ["useEffect cleanup pattern"], source: "react-docs", contentType: "code", limit: 5)
 EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blockers"], sort: "timeline")`,
-    inputSchema: z.object({
-      queries: z.preprocess(coerceJsonArray, z
-        .array(z.string())
-        .optional()
-        .describe("Array of search queries. Batch ALL questions in one call.")),
-      // limit: z.coerce.number() (not z.number()) — OpenCode's native
-      // plugin path delivers tool args straight from the LLM provider's
-      // tool-call JSON, where several providers stringify primitives
-      // (limit:"4" instead of limit:4). Since v1.0.139 / #621 we run
-      // inputSchema.parse() on that path, so a plain z.number() rejects
-      // "4" with "Expected number, received string". z.coerce mirrors what
-      // ctx_batch_execute / ctx_fetch_and_index / ctx_execute already do.
-      // Fixes #627.
-      limit: z
-        .coerce.number()
-        .optional()
-        .default(3)
-        .describe("Results per query (default: 3)"),
-      source: z
-        .string()
-        .optional()
-        .describe("Filter to a specific indexed source (partial match)."),
-      contentType: z
-        .enum(["code", "prose"])
-        .optional()
-        .describe("Filter results by content type: 'code' or 'prose'."),
-      sort: z
-        .enum(["relevance", "timeline"])
-        .optional()
-        .default("relevance")
-        .describe(
-          "Sort mode. 'relevance' (default): BM25 ranked, current session only. " +
-          "'timeline': chronological across current session, prior sessions, and auto-memory."
-        ),
-    }),
+    // Schema construction is centralised in `src/search/ctx-search-schema.ts`
+    // so the conditional `project` field (only registered when the host runs
+    // in shared-DB mode, `CONTEXT_MODE_PROJECT_DIR` set at module load) is a
+    // hard property of the tool surface — not a runtime hint. Fixes #737.
+    inputSchema: buildCtxSearchInputSchema(CTX_SEARCH_SHARED_MODE),
   },
   async (params) => {
     try {
@@ -2437,7 +2412,22 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         });
       }
 
-      const { limit = 3, source, contentType } = params as { limit?: number; source?: string; contentType?: "code" | "prose" };
+      const { limit = 3, source, contentType, project } = params as {
+        limit?: number;
+        source?: string;
+        contentType?: "code" | "prose";
+        project?: string;
+      };
+
+      // Resolve the per-project scope (#737). When shared-DB mode is off the
+      // resolver returns `undefined` and `project` is silently ignored — the
+      // per-project DB is naturally isolated by directory hash, so there is
+      // nothing for an in-process filter to do.
+      const projectScope = resolveProjectScope(
+        project,
+        CTX_SEARCH_SHARED_MODE,
+        () => getProjectDir(),
+      );
 
       // Progressive throttling: track calls in time window
       const now = Date.now();
@@ -2469,9 +2459,13 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
       let totalSize = 0;
       const sections: string[] = [];
 
-      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query)
+      // Open SessionDB once before the loop (Blocker 4: avoid open/close per query).
+      // Issue #737: also open in relevance mode when a string `projectScope`
+      // is in play — the 2-step IN-clause needs SessionDB to translate
+      // `project_dir` → allow-set of session ids for the ContentStore filter.
       let timelineDB: InstanceType<typeof SessionDB> | null = null;
-      if (sort === "timeline") {
+      const needsSessionDB = sort === "timeline" || typeof projectScope === "string";
+      if (needsSessionDB) {
         try {
           const sessionsDir = getSessionDir();
           const projectDir = getProjectDir();
@@ -2480,6 +2474,17 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
             timelineDB = new SessionDB({ dbPath: dbFile });
           }
         } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
+      }
+
+      // Resolve the session-id allow-set once for the relevance-mode path —
+      // searchAllSources resolves its own copy for timeline mode. Empty set
+      // is preserved (means "no events for this project"), which surfaces
+      // only legacy `session_id=''` chunks via the post-filter.
+      let relevanceAllowSet: Set<string> | undefined;
+      if (typeof projectScope === "string" && timelineDB) {
+        try {
+          relevanceAllowSet = new Set(timelineDB.getSessionIdsForProject(projectScope));
+        } catch { /* best-effort */ }
       }
 
       const configDir = _detectedAdapter?.getConfigDir() ?? resolveClaudeConfigDir();
@@ -2504,9 +2509,17 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
             projectDir: getProjectDir(),
             configDir,
             adapter: _detectedAdapter ?? undefined,
+            projectScope,
           });
         } else {
-          results = store.searchWithFallback(q, effectiveLimit, source, contentType);
+          results = store.searchWithFallback(
+            q,
+            effectiveLimit,
+            source,
+            contentType,
+            "like",
+            relevanceAllowSet,
+          );
         }
 
         if (results.length === 0) {
