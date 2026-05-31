@@ -1228,13 +1228,31 @@ async function upgrade(opts?: { platform?: string }) {
       // The post-bump cache-sweep below removes any pre-existing copies so
       // the previous-version-carry vector cannot replay.
 
-      // Issue #711: do NOT call normalizeHooksOnStartup during upgrade.
-      // The fresh clone files ship with ${CLAUDE_PLUGIN_ROOT} placeholders —
-      // the portable form that survives across versioned cache directories.
-      // normalizeHooksOnStartup bakes in absolute paths using the CURRENT
-      // pluginRoot (e.g. .../1.0.103/), but Claude Code may copy files to a
-      // NEW versioned dir (.../1.0.151/) making the baked-in paths stale.
-      // start.mjs normalizes on next MCP boot with the correct __dirname.
+      // Issue #711 + #414 split: normalize hooks.json (only) here.
+      //
+      //   - plugin.json must NOT be normalized during /ctx-upgrade — Claude
+      //     Code carries it forward into new versioned cache dirs on
+      //     auto-update, so baked absolute paths go stale (#711).
+      //   - hooks/hooks.json MUST be normalized during /ctx-upgrade on
+      //     Windows + Git Bash — Claude Code fires SessionStart / PreToolUse
+      //     BEFORE the MCP server boots, so the unresolved
+      //     `${CLAUDE_PLUGIN_ROOT}` placeholder yields MODULE_NOT_FOUND for
+      //     the first hook fire after upgrade (#414, originally wired in
+      //     13d1342 / #528).
+      //
+      // The narrow `normalizeHooksJsonOnly` helper preserves both invariants.
+      // start.mjs continues to call the full `normalizeHooksOnStartup` at the
+      // next MCP boot to re-heal plugin.json against the live __dirname.
+      try {
+        const mod: { normalizeHooksJsonOnly: (opts: { pluginRoot: string; nodePath: string; platform: string }) => void } =
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (await import("../hooks/normalize-hooks.mjs" as any)) as any;
+        mod.normalizeHooksJsonOnly({
+          pluginRoot,
+          nodePath: process.execPath,
+          platform: process.platform,
+        });
+      } catch { /* best effort — never block upgrade */ }
 
       s.stop(color.green(`Updated in-place to v${newVersion}`));
 

@@ -219,23 +219,35 @@ export function normalizePluginJson(content, nodePath, pluginRoot) {
 }
 
 /**
- * Apply normalization to hooks.json and plugin.json on startup.
+ * Apply normalization to hooks/hooks.json ONLY (not plugin.json).
+ *
+ * Why a narrow variant exists (#711 + #414 / #528):
+ *   - plugin.json is read by Claude Code's plugin manager and carried forward
+ *     into NEW versioned cache dirs on auto-update. Baking absolute paths into
+ *     it during /ctx-upgrade poisons the next version (#711).
+ *   - hooks/hooks.json lives in the per-version dir and is read by the SAME
+ *     Node process that needs to spawn a child. On Windows + Git Bash, Claude
+ *     Code fires SessionStart/PreToolUse BEFORE MCP boot — the unresolved
+ *     `${CLAUDE_PLUGIN_ROOT}` placeholder yields MODULE_NOT_FOUND for the
+ *     first hook fire after /ctx-upgrade (#414).
+ *
+ * So /ctx-upgrade calls THIS narrow function (hooks.json only) to close the
+ * Windows first-hook-fire window without re-introducing #711.
  *
  * Options:
- *   - pluginRoot: absolute path to plugin install dir (e.g. __dirname of start.mjs)
+ *   - pluginRoot: absolute path to plugin install dir
  *   - nodePath:   process.execPath
  *   - platform:   process.platform ("win32" and "linux" trigger a write)
  *
  * Best-effort — never throws.
  */
-export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
+export function normalizeHooksJsonOnly({ pluginRoot, nodePath, platform }) {
   // Normalize on Windows (MSYS path mangling, #369/#372/#378) and Linux
   // (bare `node` not in PATH when invoked via /bin/sh, e.g. nvm users).
   // macOS ships a system node so bare `node` resolves reliably there.
   if (platform !== "win32" && platform !== "linux") return;
   if (!pluginRoot || !nodePath) return;
 
-  // hooks/hooks.json
   try {
     const hooksPath = resolve(pluginRoot, "hooks", "hooks.json");
     if (existsSync(hooksPath)) {
@@ -250,6 +262,26 @@ export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
   } catch {
     /* best effort */
   }
+}
+
+/**
+ * Apply normalization to hooks.json and plugin.json on startup.
+ *
+ * Options:
+ *   - pluginRoot: absolute path to plugin install dir (e.g. __dirname of start.mjs)
+ *   - nodePath:   process.execPath
+ *   - platform:   process.platform ("win32" and "linux" trigger a write)
+ *
+ * Best-effort — never throws.
+ */
+export function normalizeHooksOnStartup({ pluginRoot, nodePath, platform }) {
+  // Delegate the hooks.json branch to the narrow helper so /ctx-upgrade and
+  // boot share one implementation. plugin.json normalization stays here —
+  // start.mjs and postinstall still need it; /ctx-upgrade must NOT (#711).
+  normalizeHooksJsonOnly({ pluginRoot, nodePath, platform });
+
+  if (platform !== "win32" && platform !== "linux") return;
+  if (!pluginRoot || !nodePath) return;
 
   // .claude-plugin/plugin.json
   try {
